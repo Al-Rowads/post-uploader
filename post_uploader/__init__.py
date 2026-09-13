@@ -1,0 +1,1 @@
+"""Telegram video publishing service."""

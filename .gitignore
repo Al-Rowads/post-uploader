@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+data/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*tiktok*credentials*.json
+
+*youtube*credentials*.json
+*youtube*secret*.json
+!website/dist/
+!website/dist/**

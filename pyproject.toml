@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "post-uploader"
+version = "0.1.0"
+description = "A persistent Telegram-to-YouTube-and-TikTok publisher"
+requires-python = ">=3.13"
+dependencies = ["httpx>=0.28,<0.29"]
+
+[project.scripts]
+post-uploader = "post_uploader.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["post_uploader*"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
