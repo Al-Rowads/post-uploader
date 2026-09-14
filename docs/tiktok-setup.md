@@ -12,7 +12,7 @@
 - Website: `https://upload.al-rowads.com/`.
 - Terms: `https://upload.al-rowads.com/terms/`.
 - Privacy: `https://upload.al-rowads.com/privacy/`.
-- The 1024×1024 app icon and all required URLs are saved. The URLs are intended for later deployment.
+- The 1024×1024 app icon and all required URLs are saved. The URLs are live over HTTPS on the requested server.
 - Real sandbox app credentials are saved in gitignored `data/tiktok-credentials.json`, mode 0600.
 - Target account **@al.rowads** is registered in the sandbox.
 - OAuth consent completed with `user.info.basic` and `video.upload`; access and refresh tokens
@@ -31,7 +31,7 @@ approval requirements. Production availability and public posting from this app 
 
 ## Finish developer configuration
 
-1. Deploy `website/dist/` at `https://upload.al-rowads.com`. See [website deployment](../website/README.md).
+1. Website deployment is complete at `https://upload.al-rowads.com`. See [server operations](../deploy/README.md).
 2. Target registration and upload OAuth consent for **@al.rowads** are complete.
 3. Use the OAuth helper below only when renewing or replacing authorization; stop the worker first.
 4. Complete any requested ownership verification. Production review is separate; sandbox

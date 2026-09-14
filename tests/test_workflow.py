@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from post_uploader.config import Config
 from post_uploader.database import Database
@@ -216,6 +217,72 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.get_setting("paused"), "true")
         self.service.command(1, "/resume")
         self.assertEqual(self.db.get_setting("paused"), "false")
+
+    async def test_ineligible_short_skips_youtube_and_continues_tiktok(self):
+        self.service.handle_update(self.update())
+        path = self.root / "bot" / "videos" / "video.mp4"
+        self.db.execute("UPDATE jobs SET local_path=? WHERE id=1", (str(path),))
+        video = Video(100, 30, 1920, 1080, 30, "h264", "mov,mp4")
+
+        async def record_tiktok_attempt(*args):
+            self.db.prepare_attempt(1, ["tiktok"], provider="tiktok")
+
+        with (
+            patch("post_uploader.service.safe_media_path", return_value=path),
+            patch("post_uploader.service.inspect_video", AsyncMock(return_value=video)),
+            patch.object(self.service.youtube, "credentials", AsyncMock()) as youtube_auth,
+            patch.object(self.service.youtube, "initialize", AsyncMock()) as youtube_upload,
+            patch.object(self.service.tiktok, "credentials", AsyncMock()),
+            patch.object(
+                self.service, "submit_tiktok", AsyncMock(side_effect=record_tiktok_attempt)
+            ) as tiktok_upload,
+        ):
+            await self.service.prepare(self.db.job(1))
+            youtube_auth.assert_not_awaited()
+            youtube_upload.assert_not_awaited()
+            tiktok_upload.assert_awaited_once()
+        destinations = {row["platform"]: row for row in self.db.destinations(1)}
+        self.assertEqual(destinations["youtube"]["state"], "invalid")
+        self.assertIn("16:9", destinations["youtube"]["message"])
+        self.assertEqual(destinations["tiktok"]["state"], "pending")
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM attempts WHERE provider='youtube'").fetchone()[0],
+            0,
+        )
+        self.db.outcome(1, "tiktok", Outcome("needs_action"))
+        self.db.finish_if_terminal(1)
+        self.assertIn("Invalid media needs a new video", self.db.retry(1))
+        states = {row["platform"]: row["state"] for row in self.db.destinations(1)}
+        self.assertEqual(states["youtube"], "invalid")
+
+    async def test_eligible_short_uses_existing_youtube_submission(self):
+        self.service.handle_update(self.update())
+        path = self.root / "bot" / "videos" / "video.mp4"
+        self.db.execute("UPDATE jobs SET local_path=? WHERE id=1", (str(path),))
+        self.db.outcome(1, "tiktok", Outcome("needs_action"))
+        video = Video(100, 180, 1080, 1920, 30, "h264", "mov,mp4")
+
+        async def record_youtube_attempt(*args):
+            self.db.prepare_attempt(1, ["youtube"], provider="youtube")
+
+        with (
+            patch("post_uploader.service.safe_media_path", return_value=path),
+            patch("post_uploader.service.inspect_video", AsyncMock(return_value=video)),
+            patch.object(self.service.youtube, "credentials", AsyncMock()) as youtube_auth,
+            patch.object(
+                self.service, "submit_youtube", AsyncMock(side_effect=record_youtube_attempt)
+            ) as youtube_upload,
+        ):
+            await self.service.prepare(self.db.job(1))
+            youtube_auth.assert_awaited_once()
+            youtube_upload.assert_awaited_once()
+            job, submitted_path = youtube_upload.await_args.args
+            self.assertEqual(job["caption"], "River walk")
+            self.assertEqual(submitted_path, path)
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM attempts WHERE provider='youtube'").fetchone()[0],
+            1,
+        )
 
     async def test_explicit_failed_result_does_not_erase_prior_success(self):
         self.service.handle_update(self.update())

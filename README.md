@@ -2,7 +2,8 @@
 
 A private Telegram bot that uploads original videos directly to YouTube and sends TikTok
 drafts to the connected account’s inbox. New uploads no longer use Upload-Post. YouTube is
-configured **private** locally; review in YouTube Studio before public publication. TikTok
+configured to request **public** visibility locally and on the server. YouTube may still restrict
+uploads to private until its API-project audit is approved. TikTok
 requires manual caption, disclosure, visibility, and publishing choices inside TikTok.
 
 ## Current setup
@@ -16,9 +17,10 @@ requires manual caption, disclosure, visibility, and publishing choices inside T
   live basic-profile API check verified `video.upload` access on September 13, 2026.
   This is sandbox access; production approval and real draft delivery remain separate.
 - The owner explicitly set all three YouTube content declarations to `false` in `.env`.
-  Telegram credentials still need values. The bot has not been started against a live Telegram account.
-- Information pages for `https://upload.al-rowads.com` are ready in `website/dist/`.
-  They have not been deployed. See [website deployment](website/README.md).
+  Telegram credentials and owner ID are configured. The bot is deployed under `/opt/post-uploader`
+  on the requested server; see [server operations](deploy/README.md).
+- Information pages are live at https://upload.al-rowads.com with HTTPS and a localhost-only
+  Docker web container. See [website deployment](website/README.md).
 
 See [TikTok setup](docs/tiktok-setup.md) for the exact remaining account steps.
 
@@ -56,7 +58,7 @@ mode `0600`. Fill these settings before starting:
 | `YOUTUBE_CREDENTIALS_FILE` | Writable Google authorized-user JSON, including refresh token |
 | `YOUTUBE_CLIENT_SECRETS_FILE` | Saved original desktop OAuth client for future reauthorization; not the runtime token |
 | `TIKTOK_CREDENTIALS_FILE` | Writable JSON containing TikTok app credentials and authorized user tokens |
-| `YOUTUBE_PRIVACY_STATUS` | `private`, `unlisted`, or `public`; local setup uses `private` |
+| `YOUTUBE_PRIVACY_STATUS` | `private`, `unlisted`, or `public`; local setup uses `public` |
 | `YOUTUBE_MADE_FOR_KIDS` | Explicit `true` or `false` for this owner’s videos |
 | `YOUTUBE_CONTAINS_SYNTHETIC_MEDIA` | Explicit `true` or `false` for this owner’s videos |
 | `YOUTUBE_PAID_PRODUCT_PLACEMENT` | Explicit declaration; `true` is rejected by this native path, so use Studio for paid-promotion uploads |
@@ -99,9 +101,23 @@ into TikTok (up to 2,200 characters, and at most 5,000 UTF-8 bytes for YouTube).
 rewrite captions or modify videos. Every album item is a separate job. Reply with missing
 caption text before any submission begins.
 
-Files must be at most 2,000,000,000 bytes. `ffprobe` validates the original media. TikTok checks
-container, codecs, dimensions, frame rate, and a conservative 3–600 second duration range;
-TikTok may enforce additional account restrictions. An ineligible TikTok file can still go to YouTube.
+Files must be at most 2,000,000,000 bytes. `ffprobe` validates the original media. New YouTube
+uploads must be Shorts-ready: square or vertical when displayed, with a positive duration of
+at most 180 seconds. The orientation check accounts for rotation and pixel aspect ratio; an
+unspecified pixel aspect ratio uses the encoded dimensions. Ineligible videos are marked
+`invalid` for YouTube before an upload starts. Edit and resend them as a new video;
+`/retry` does not resubmit invalid media. The bot does not crop, pad, trim, or transcode files.
+
+YouTube automatically classifies eligible uploads as Shorts through the normal upload API;
+there is no separate Shorts flag, and the bot does not add hashtags. Upload completion does
+not confirm Shorts classification; review the processed result in YouTube Studio.
+See [YouTube's Shorts requirements](https://support.google.com/youtube/answer/15424877?hl=en).
+Existing resumable uploads continue unchanged; queued videos are checked before starting
+a new YouTube upload.
+
+TikTok independently checks container, codecs, dimensions, frame rate, and a conservative
+3–600 second duration range; TikTok may enforce additional account restrictions. A video
+rejected by one platform can still proceed to the other if it meets that platform's requirements.
 
 | Command | Behavior |
 | --- | --- |

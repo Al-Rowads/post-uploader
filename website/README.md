@@ -16,7 +16,9 @@ fallback. Preserve `assets/`. Configure HTTPS and redirect HTTP to HTTPS. Make t
 publicly readable without login. Do not publish `.env`, `data/`, the Python source directory,
 or a directory listing of the repository. `404.html` is available for the host’s error-page setting.
 The `.openai/hosting.json` manifest also describes the static output for optional later Sites hosting.
-No site has been registered or deployed in this task because deployment was deferred by the owner.
+The site is deployed on the owner’s server at https://upload.al-rowads.com using the existing
+Nginx layout and a Docker container at 127.0.0.1:3002. See [server operations](../deploy/README.md).
+No separate Sites-hosted project was registered.
 
 Local preview:
 

@@ -17,7 +17,9 @@ from .youtube import YouTube, upload_metadata, upload_outcome, uploaded_offset
 
 logger = logging.getLogger(__name__)
 
-HELP = """Send a video with a caption to upload to YouTube and send a draft to TikTok.
+HELP = """Send a video with a caption to upload to YouTube Shorts and send a draft to TikTok.
+YouTube Shorts: square or vertical, up to 180 seconds. Ineligible videos must be edited and resent.
+The bot uploads original files; YouTube determines Shorts classification after processing.
 First caption line: YouTube title (up to 100 characters).
 Full caption: YouTube description; copy it into TikTok when finishing the draft.
 Open the TikTok inbox notification to add captions, disclosures, and public visibility.
@@ -236,6 +238,9 @@ class Service:
                 continue
             try:
                 if platform == "youtube":
+                    if reason := video.youtube_shorts_error():
+                        self.db.outcome(job_id, platform, Outcome("invalid", reason))
+                        continue
                     await self.youtube.credentials()
                     if self.db.job(job_id)["state"] == "cancelled":
                         return
