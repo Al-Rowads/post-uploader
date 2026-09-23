@@ -70,7 +70,7 @@ class Database:
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise RuntimeError(
                 "Unsupported database version; use the matching application version."
             )
@@ -89,6 +89,11 @@ class Database:
 
         if version < 4:
             self.migrate_reviews()
+        if version < 5:
+            with self.transaction():
+                self.execute("ALTER TABLE media_assets ADD COLUMN telegram_video_path TEXT")
+                self.execute("ALTER TABLE media_assets ADD COLUMN telegram_video_file_id TEXT")
+                self.execute("PRAGMA user_version = 5")
 
     def migrate_reviews(self):
         with self.transaction():

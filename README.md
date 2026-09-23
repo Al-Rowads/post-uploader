@@ -30,9 +30,19 @@ for the title and platform label inside Telegram's 1,024-character media caption
 is rejected rather than truncated. Emoji can count as two code units.
 
 The entered title becomes the YouTube title. Each destination publishes its approved caption;
-review-only labels and buttons are not included in published posts. Telegram video documents
-remain documents because Telegram file IDs cannot change media type. There is no transcoding,
-trimming, or cropping. Files can be up to 2,000,000,000 bytes, subject to configured disk limits.
+review-only labels and buttons are not included in published posts. All Telegram previews and
+channel posts use playable videos, including sources uploaded as documents. Compatible streams
+are repackaged into streaming-ready MP4 without quality loss; incompatible streams are converted
+to H.264 video and AAC audio. Silent videos remain silent. Conversion preserves duration and
+display orientation, with minimal padding for odd dimensions; it does not trim or crop.
+YouTube and TikTok continue using the original file. Source and converted files must each fit
+within the configured limit (up to 2,000,000,000 bytes) and available disk space.
+
+**Learning Notes:** Telegram cannot change a document's media type using its existing file ID.
+The bot uploads an MP4 copy and saves the returned video ID for later previews and publication.
+
+**Why This Matters:** Conversion runs once per media asset, and another platform's approved
+original stays unchanged. Conversion failure requests a replacement instead of posting a file.
 
 YouTube Shorts must display square or vertical and have a positive duration of at most
 180 seconds. TikTok validates format, codec, dimensions, frame rate, and its creator-specific
@@ -54,7 +64,8 @@ activation switch are deferred.
 
 ## Configuration
 
-Python 3.13+ and `ffprobe` are required. Install the dependencies in `requirements.lock`.
+Python 3.13+, `ffprobe`, and `ffmpeg` with the libx264 and AAC encoders are required. The Docker
+image includes FFmpeg. Install the Python dependencies in `requirements.lock`.
 Commands read `.env` literally; exported environment variables take precedence. Preserve
 existing credentials, and keep `.env` and credential files outside version control with
 owner-only permissions. Start from `.env.example` for a new installation.
@@ -133,7 +144,10 @@ Before upgrading, stop the worker and back up the SQLite database and credential
 Schema version 4 adds per-destination captions, media references, review revisions, prompt
 associations, and immutable attempt snapshots. Existing unsent destinations return to review;
 existing Upload-Post, TikTok inbox, and YouTube resumable attempts retain their identifiers.
-Older application versions cannot open version 4; rollback requires the pre-upgrade backup.
+Schema version 5 adds cached Telegram video paths and file IDs without changing existing
+approvals, original media, or attempt snapshots. Existing unsent document sources are converted
+when needed; historical published posts are not changed. Older application versions cannot open
+version 5; rollback requires the pre-upgrade backup.
 
 Supply the OpenRouter key before restarting. Configure optional destinations, update the bot
 and website/Nginx routing, then explicitly activate those destinations. Do not overwrite newer
@@ -162,7 +176,11 @@ which may itself be private.
 
 Downloaded media is eligible for cleanup after 72 hours by default once its job is settled or
 cancelled. Pending reviews, shared media references, live download links, and unresolved
-attempts protect required files. Expiring TikTok preview links last 15 minutes; publishing
+attempts protect required files, including converted Telegram copies. Copies live under
+`TELEGRAM_FILES_DIRECTORY/post-uploader/videos`; confirmed video IDs remain reusable after local
+cleanup. Conversions run one at a time with a one-hour timeout, monitored size/disk limits, and
+atomic completion. Interrupted partial conversions are removed at startup and regenerated when
+needed. Expiring TikTok preview links last 15 minutes; publishing
 links last up to two hours and are restricted to the selected media revision. Queue history
 and credentials remain until removed by the operator.
 
@@ -184,7 +202,8 @@ Tests exercise SQLite migrations, prompt/callback routing, independent reviews a
 OpenRouter response validation, native protocol handling, signed Mini App authentication,
 media range requests, and recovery. External calls are isolated in protocol tests; they do not
 establish live platform approval or delivery. Set `MEDIA_TEST_VIDEO` to an existing real video
-and install `ffprobe` to enable the optional media integration test.
+and install `ffprobe` to enable the optional source-media integration test. Install both FFmpeg
+tools to run the Telegram conversion integration tests, which exercise actual encoded media.
 
 ## Primary references
 

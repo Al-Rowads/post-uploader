@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 
 from .config import Config
+from .media import MediaError, safe_telegram_video_path
 
 
 class RemoteError(Exception):
@@ -120,20 +121,34 @@ class Telegram:
         }
 
     async def send_media(self, chat_id, media, caption, *, reply_markup=None, message_id=None):
-        kind = media["kind"]
-        # Telegram file IDs cannot change type: a document remains a document.
+        if media["kind"] != "video":
+            raise MediaError("Prepare a Telegram video before sending this media.")
+        reference = media["file_id"]
+        if not reference:
+            reference = safe_telegram_video_path(
+                Path(media["local_path"]), self.config.telegram_files
+            ).as_uri()
+        options = {
+            key: media[key]
+            for key in ("width", "height", "duration", "supports_streaming")
+            if key in media
+        }
         parameters = {"chat_id": chat_id, "reply_markup": reply_markup or {"inline_keyboard": []}}
+        # Local-path uploads can take much longer than file-ID resends.
+        if not media["file_id"]:
+            parameters["_timeout"] = httpx.Timeout(3600, connect=10)
         if message_id is not None:
             return await self.call(
                 "editMessageMedia",
                 **parameters,
                 message_id=message_id,
-                media={"type": kind, "media": media["file_id"], "caption": caption},
+                media={"type": "video", "media": reference, "caption": caption, **options},
             )
         return await self.call(
-            "sendVideo" if kind == "video" else "sendDocument",
+            "sendVideo",
             **parameters,
-            **{kind: media["file_id"]},
+            **options,
+            video=reference,
             caption=caption,
         )
 

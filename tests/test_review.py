@@ -110,6 +110,11 @@ class ReviewFixture(unittest.IsolatedAsyncioTestCase):
                     "message_id": values.get("message_id", self.sequence),
                     "chat": {"id": values["chat_id"]},
                 }
+                if method in {"sendVideo", "editMessageMedia"}:
+                    reference = values.get("video") or values.get("media", {}).get("media")
+                    result["video"] = {
+                        "file_id": "converted-video" if reference.startswith("file:") else reference
+                    }
             else:
                 raise AssertionError(f"Unexpected Telegram request: {method}")
             return httpx.Response(200, json={"ok": True, "result": result})
@@ -491,7 +496,7 @@ class ReviewTests(ReviewFixture):
 
     async def test_unreadable_legacy_preview_requests_replacement_once(self):
         job_id = await self.ready_for_review()
-        self.db.execute("UPDATE media_assets SET kind='unknown'")
+        self.db.execute("UPDATE media_assets SET kind='unknown',telegram_video_file_id=NULL")
         self.db.change_review(job_id, "youtube", "review")
         with patch.object(
             self.service.review, "ensure_media", AsyncMock(side_effect=MediaError("unreadable"))
@@ -507,14 +512,18 @@ class ReviewTests(ReviewFixture):
             1,
         )
 
-    async def test_video_documents_use_document_method(self):
+    async def test_unreadable_documents_request_replacement_without_sending_document(self):
         self.db.set_setting("active_platforms", '["telegram"]')
         job_id = self.upload(document=True)
         self.db.execute("UPDATE jobs SET title='Document',state='reviewing'")
         self.db.execute("UPDATE destinations SET caption='Document caption',state='review'")
         self.db.preview(job_id, "telegram")
-        await self.drain()
-        self.assertTrue(any(method == "sendDocument" for method, _ in self.sent))
+        with patch.object(
+            self.service.review, "ensure_media", AsyncMock(side_effect=MediaError("unreadable"))
+        ):
+            await self.drain()
+        self.assertEqual(self.db.destination(job_id, "telegram")["state"], "waiting_video")
+        self.assertFalse(any(method == "sendDocument" for method, _ in self.sent))
         self.assertFalse(any(method == "sendVideo" for method, _ in self.sent))
 
     async def test_unknown_tiktok_initialization_does_not_fall_back_to_inbox(self):

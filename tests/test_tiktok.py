@@ -135,7 +135,7 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(attempt["polls"], 7)
                 self.assertEqual(database.destination(1, "tiktok")["state"], "review")
                 self.assertEqual(database.destination(1, "tiktok")["caption"], "Original caption")
-                self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 5)
                 with self.assertRaises(ValueError):
                     database.prepare_attempt(1, ["tiktok"], "tiktok_direct")
             finally:

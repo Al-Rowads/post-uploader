@@ -77,7 +77,11 @@ to the running server.
 
 1. Stop the bot and make a consistent backup of its queue database and credential directory.
    Schema version 4 preserves existing provider attempts but requires explicit review for
-   unsent destinations. A rollback needs the pre-upgrade database backup.
+   unsent destinations. Schema version 5 adds Telegram video-copy paths and cached video IDs
+   without changing existing approvals or attempts. A rollback needs the pre-upgrade database
+   backup. Rebuild the bot image to include the updated video delivery code; the image already
+   includes FFmpeg. Converted copies use the existing shared `telegram-media` volume and its
+   configured disk reserve and retention limits.
 2. Add `OPENROUTER_API_KEY` to the server `.env`. The default model is
    `google/gemini-2.5-flash-lite`. For Telegram channel publishing, set `TELEGRAM_CHANNEL_ID`
    and grant the bot administrator permission to post in that channel.

@@ -10,7 +10,7 @@ from .clients import Publisher, RemoteError, Telegram
 from .config import Config, owner_matches
 from .database import Database
 from .domain import TERMINAL_DESTINATIONS, Outcome, outcome_from_result, result_list
-from .media import MediaError, safe_media_path
+from .media import MediaError, cleanup_telegram_partials, safe_media_path, safe_telegram_video_path
 from .openrouter import OpenRouter
 from .review import ReviewWorkflow
 from .tiktok import TikTok, direct_outcome, direct_post_info, draft_outcome
@@ -23,9 +23,9 @@ HELP = """Send a video, then reply with a title and a master caption.
 The bot generates a caption and sends a separate preview for every active platform.
 Accept publishes that version. TikTok Accept opens its settings and final Publish form.
 Reject lets you replace only that platform's caption or video. Reply to the replacement prompt.
-Videos are not cropped or transcoded.
+Video files are converted to playable MP4 for Telegram when needed; originals stay unchanged.
 YouTube Shorts must be square/vertical and at most 180 seconds.
-Video documents stay documents in Telegram. Each album item is a separate job.
+Previews and Telegram posts are sent as videos. Each album item is a separate job.
 
 /platforms — choose platforms for future videos
 /status [job_id] — review progress and platform results
@@ -197,6 +197,9 @@ class Service:
                         )
                     await self.youtube.credentials()
                 elif platform == "telegram":
+                    publication["telegram_media"] = await self.review.ensure_telegram_media(
+                        destination["media_id"]
+                    )
                     channel_id = publication["settings"].get("chat_id")
                     if not channel_id:
                         raise RemoteError(
@@ -254,6 +257,13 @@ class Service:
 
     async def submit_telegram(self, publication):
         job_id = publication["id"]
+        if "telegram_media" not in publication:
+            publication = {
+                **publication,
+                "telegram_media": await self.review.ensure_telegram_media(publication["media_id"]),
+            }
+        if self.db.get_setting("paused") == "true":
+            return
         request_id = self.db.prepare_attempt(job_id, ["telegram"], "telegram", publication)
         self.uploads_in_flight.add(request_id)
         outcome = Outcome(
@@ -264,14 +274,11 @@ class Service:
         try:
             result = await self.telegram.send_media(
                 publication["settings"]["chat_id"],
-                publication,
+                publication["telegram_media"],
                 publication["caption"],
             )
-            if (
-                isinstance(result, dict)
-                and type(result.get("message_id")) is int
-                and isinstance(result.get("chat"), dict)
-                and result.get("chat", {}).get("id") == publication["settings"]["chat_id"]
+            if self.review.cache_telegram_video(
+                publication["media_id"], result, publication["settings"]["chat_id"]
             ):
                 message_id = result["message_id"]
                 username = publication["settings"].get("username")
@@ -677,51 +684,58 @@ class Service:
         cutoff = time.time() - self.config.media_retention_hours * 3600
         self.db.execute("DELETE FROM media_links WHERE expires_at<=?", (time.time(),))
         media_rows = self.db.execute(
-            "SELECT * FROM media_assets WHERE local_path IS NOT NULL "
+            "SELECT * FROM media_assets WHERE (local_path IS NOT NULL "
+            "OR telegram_video_path IS NOT NULL) "
             "AND COALESCE(saved_at,created_at)<?",
             (cutoff,),
         ).fetchall()
+        attempts = self.db.execute(
+            "SELECT snapshot FROM attempts WHERE state IN ('tracking','unknown')"
+        ).fetchall()
+        protected_paths = set()
+        for attempt in attempts:
+            snapshot = json.loads(attempt[0] or "{}")
+            protected_paths.add(snapshot.get("local_path"))
+            protected_paths.add(snapshot.get("telegram_media", {}).get("local_path"))
+        for media_id in self.review.preparing_telegram_media:
+            media = self.db.media(media_id)
+            protected_paths.update((media["local_path"], media["telegram_video_path"]))
         for media in media_rows:
-            # Paths may be shared across Telegram file IDs and across destination versions.
-            referenced = self.db.execute(
-                "SELECT 1 FROM destinations d JOIN media_assets m ON d.media_id=m.id "
-                "JOIN jobs j ON j.id=d.job_id WHERE m.local_path=? "
-                "AND (j.state NOT IN ('settled','cancelled') OR d.state IN ('pending','unknown'))",
-                (media["local_path"],),
-            ).fetchone()
-            links = self.db.execute(
-                "SELECT 1 FROM media_links l JOIN media_assets m "
-                "ON m.id=l.media_id WHERE m.local_path=?",
-                (media["local_path"],),
-            ).fetchone()
-            attempts = self.db.execute(
-                "SELECT snapshot FROM attempts WHERE state IN ('tracking','unknown')"
-            ).fetchall()
-            if (
-                referenced
-                or links
-                or any(
-                    json.loads(a[0] or "{}").get("local_path") == media["local_path"]
-                    for a in attempts
-                )
-            ):
-                continue
-            try:
-                safe_media_path(Path(media["local_path"]), self.config.telegram_files).unlink()
-            except FileNotFoundError:
-                pass
-            except (OSError, MediaError):
-                logger.warning("Could not clean media asset %s", media["id"])
-                continue
-            self.db.execute(
-                "UPDATE media_assets SET local_path=NULL WHERE local_path=?", (media["local_path"],)
-            )
-            self.db.execute(
-                "UPDATE jobs SET local_path=NULL WHERE local_path=?", (media["local_path"],)
-            )
+            for column in ("local_path", "telegram_video_path"):
+                path = media[column]
+                if path and path not in protected_paths:
+                    self.cleanup_media_path(path, column)
+
+    def cleanup_media_path(self, path, column):
+        # Paths may be shared across Telegram file IDs and across destination versions.
+        referenced = self.db.execute(
+            "SELECT 1 FROM destinations d JOIN media_assets m ON d.media_id=m.id "
+            f"JOIN jobs j ON j.id=d.job_id WHERE m.{column}=? "
+            "AND (j.state NOT IN ('settled','cancelled') OR d.state IN ('pending','unknown'))",
+            (path,),
+        ).fetchone()
+        links = self.db.execute(
+            "SELECT 1 FROM media_links l JOIN media_assets m "
+            f"ON m.id=l.media_id WHERE m.{column}=?",
+            (path,),
+        ).fetchone()
+        if referenced or links:
+            return
+        try:
+            validate = safe_media_path if column == "local_path" else safe_telegram_video_path
+            validate(Path(path), self.config.telegram_files).unlink()
+        except FileNotFoundError:
+            pass
+        except (OSError, MediaError):
+            logger.warning("Could not clean %s", column)
+            return
+        self.db.execute(f"UPDATE media_assets SET {column}=NULL WHERE {column}=?", (path,))
+        if column == "local_path":
+            self.db.execute("UPDATE jobs SET local_path=NULL WHERE local_path=?", (path,))
 
     async def run(self):
         self.db.recover()
+        cleanup_telegram_partials(self.config.telegram_files)
         await self.telegram.call("getMe")
         if self.config.tiktok_direct_mode != "disabled":
             await self.web.start()

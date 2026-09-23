@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shutil
 import time
@@ -13,7 +14,15 @@ from .domain import (
     validate_platform_caption,
     validate_title,
 )
-from .media import MediaError, inspect_video, safe_media_path
+from .media import (
+    MediaError,
+    MediaStorageError,
+    inspect_video,
+    prepare_telegram_video,
+    safe_media_path,
+    safe_telegram_video_path,
+    telegram_video_directory,
+)
 
 REVIEW_STATES = {"review", "rejecting", "waiting_caption", "waiting_video", "tiktok_settings"}
 
@@ -24,6 +33,8 @@ class ReviewWorkflow:
         self.db = service.db
         self.config = service.config
         self.telegram = service.telegram
+        self.telegram_media_lock = asyncio.Lock()
+        self.preparing_telegram_media: set[int] = set()
 
     def platform_menu(self, chat_id):
         active = self.db.active_platforms()
@@ -344,32 +355,35 @@ class ReviewWorkflow:
             return None
         markup = self.keyboard(job["id"], destination)
         media = self.db.media(destination["media_id"])
-        if media["kind"] == "unknown":
-            if destination["state"] == "waiting_video":
-                return None
-            try:
-                await self.ensure_media(media["id"])
-            except (MediaError, RemoteError) as error:
-                if isinstance(error, RemoteError) and error.status not in {400, 404}:
-                    raise
-                current = self.db.destination(job["id"], destination["platform"])
-                if current["revision"] == destination["revision"]:
-                    self.db.notify(
-                        job["chat_id"],
-                        "This older video's preview is unavailable. Reply with a replacement "
-                        f"for {PLATFORM_LABELS[destination['platform']]}.",
-                        job["id"],
-                    )
-                    self.db.change_review(job["id"], destination["platform"], "waiting_video")
-                return None
-            media = self.db.media(media["id"])
+        if destination["state"] == "waiting_video" and media["kind"] != "video":
+            return None
+        try:
+            telegram_media = await self.ensure_telegram_media(media["id"])
+        except (MediaError, RemoteError) as error:
+            if isinstance(error, RemoteError) and error.status not in {400, 404}:
+                raise
             current = self.db.destination(job["id"], destination["platform"])
-            if current["revision"] != destination["revision"]:
-                return None
+            if (
+                current["revision"] == destination["revision"]
+                and current["state"] in REVIEW_STATES
+                and current["state"] != "waiting_video"
+            ):
+                self.db.notify(
+                    job["chat_id"],
+                    "This video's preview is unavailable. Reply with a replacement "
+                    f"for {PLATFORM_LABELS[destination['platform']]}. "
+                    + self.config.redact(str(error)),
+                    job["id"],
+                )
+                self.db.change_review(job["id"], destination["platform"], "waiting_video")
+            return None
+        current = self.db.destination(job["id"], destination["platform"])
+        if current["revision"] != destination["revision"]:
+            return None
         try:
             result = await self.telegram.send_media(
                 row["chat_id"],
-                media,
+                telegram_media,
                 review_caption(job, destination),
                 reply_markup=markup,
                 message_id=destination["preview_message_id"],
@@ -387,17 +401,94 @@ class ReviewWorkflow:
             ):
                 result = await self.telegram.send_media(
                     row["chat_id"],
-                    media,
+                    telegram_media,
                     review_caption(job, destination),
                     reply_markup=markup,
                 )
             else:
                 raise
+        if not self.cache_telegram_video(media["id"], result, row["chat_id"]):
+            raise RemoteError("Telegram did not confirm a playable video preview.")
         self.db.execute(
             "UPDATE destinations SET preview_message_id=? WHERE job_id=? AND platform=?",
             (result["message_id"], job["id"], destination["platform"]),
         )
         return result
+
+    def cache_telegram_video(self, media_id, result, chat_id):
+        if not (
+            isinstance(result, dict)
+            and type(result.get("message_id")) is int
+            and isinstance(result.get("chat"), dict)
+            and result["chat"].get("id") == chat_id
+            and isinstance(result.get("video"), dict)
+            and isinstance(result["video"].get("file_id"), str)
+            and result["video"]["file_id"]
+        ):
+            return False
+        self.db.execute(
+            "UPDATE media_assets SET telegram_video_file_id=? WHERE id=?",
+            (result["video"]["file_id"], media_id),
+        )
+        return True
+
+    async def ensure_telegram_media(self, media_id):
+        # Shared across previews and the publisher; avoid duplicate downloads/conversions.
+        async with self.telegram_media_lock:
+            self.preparing_telegram_media.add(media_id)
+            try:
+                return await self.prepare_telegram_media(media_id)
+            except MediaStorageError as error:
+                raise RemoteError(str(error) + " Retry after freeing space.", 503, 600) from error
+            finally:
+                self.preparing_telegram_media.discard(media_id)
+
+    async def prepare_telegram_media(self, media_id):
+        media = self.db.media(media_id)
+        if media["telegram_video_file_id"]:
+            return {"kind": "video", "file_id": media["telegram_video_file_id"]}
+        if media["kind"] == "video":
+            return {"kind": "video", "file_id": media["file_id"]}
+        source, video = await self.ensure_media(media_id)
+        media = self.db.media(media_id)
+        if media["kind"] == "video":
+            return {"kind": "video", "file_id": media["file_id"]}
+        target = telegram_video_directory(self.config.telegram_files) / f"{media_id}.mp4"
+        if media["telegram_video_path"]:
+            # Validate the recorded path even if the file has since been removed.
+            if Path(media["telegram_video_path"]) != target:
+                raise MediaError("Invalid stored Telegram conversion path.")
+        if target.exists():
+            target = safe_telegram_video_path(target, self.config.telegram_files)
+            try:
+                prepared = await inspect_video(
+                    target, target.stat().st_size, self.config.max_video_bytes
+                )
+                if reason := prepared.telegram_error():
+                    raise MediaError(reason)
+            except MediaError:
+                target.unlink()
+        if not target.exists():
+            self.db.execute(
+                "UPDATE media_assets SET telegram_video_path=?,saved_at=? WHERE id=?",
+                (str(target), time.time(), media_id),
+            )
+            prepared = await prepare_telegram_video(
+                source,
+                video,
+                target,
+                max_size=self.config.max_video_bytes,
+                disk_reserve=self.config.disk_reserve_bytes,
+            )
+        self.db.execute(
+            "UPDATE media_assets SET telegram_video_path=? WHERE id=?", (str(target), media_id)
+        )
+        return {
+            "kind": "video",
+            "file_id": None,
+            "local_path": str(target),
+            **prepared.telegram_parameters(),
+        }
 
     async def ensure_media(self, media_id):
         media = self.db.media(media_id)
@@ -488,6 +579,8 @@ class ReviewWorkflow:
             _, video = await self.ensure_media(destination["media_id"])
             if platform == "youtube" and (reason := video.youtube_shorts_error()):
                 raise MediaError(reason)
+            if platform == "telegram":
+                await self.ensure_telegram_media(destination["media_id"])
             if platform == "tiktok":
                 self.check_direct_config()
                 await self.check_tiktok_identity("video.publish")
