@@ -75,7 +75,10 @@ class Telegram:
 
     async def get_updates(self, offset: int):
         return await self.call(
-            "getUpdates", offset=offset, timeout=30, allowed_updates=["message", "edited_message"]
+            "getUpdates",
+            offset=offset,
+            timeout=30,
+            allowed_updates=["message", "edited_message", "callback_query"],
         )
 
     async def download(self, file_id: str) -> Path:
@@ -87,12 +90,51 @@ class Telegram:
             raise RemoteError("Local Bot API did not return an absolute file path.")
         return Path(path)
 
-    async def send(self, chat_id: int, text: str):
+    async def send(self, chat_id: int, text: str, **parameters):
         return await self.call(
             "sendMessage",
             chat_id=chat_id,
             text=self.config.redact(text, limit=4000),
             link_preview_options={"is_disabled": True},
+            **parameters,
+        )
+
+    async def channel(self, channel_id: str | int) -> dict:
+        if not channel_id:
+            raise RemoteError("Set TELEGRAM_CHANNEL_ID before enabling Telegram publishing.", 400)
+        chat = await self.call("getChat", chat_id=channel_id)
+        bot = await self.call("getMe")
+        member = await self.call("getChatMember", chat_id=chat["id"], user_id=bot["id"])
+        if chat.get("type") != "channel" or not (
+            member.get("status") == "creator"
+            or member.get("status") == "administrator"
+            and member.get("can_post_messages") is True
+        ):
+            raise RemoteError(
+                "The bot needs channel administrator permission to post messages.", 403
+            )
+        return {
+            "chat_id": chat["id"],
+            "username": chat.get("username"),
+            "title": chat.get("title", str(chat["id"])),
+        }
+
+    async def send_media(self, chat_id, media, caption, *, reply_markup=None, message_id=None):
+        kind = media["kind"]
+        # Telegram file IDs cannot change type: a document remains a document.
+        parameters = {"chat_id": chat_id, "reply_markup": reply_markup or {"inline_keyboard": []}}
+        if message_id is not None:
+            return await self.call(
+                "editMessageMedia",
+                **parameters,
+                message_id=message_id,
+                media={"type": kind, "media": media["file_id"], "caption": caption},
+            )
+        return await self.call(
+            "sendVideo" if kind == "video" else "sendDocument",
+            **parameters,
+            **{kind: media["file_id"]},
+            caption=caption,
         )
 
 

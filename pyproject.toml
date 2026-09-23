@@ -5,15 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "post-uploader"
 version = "0.1.0"
-description = "A persistent Telegram-to-YouTube-and-TikTok publisher"
+description = "A persistent multi-platform video publisher with caption generation and review"
 requires-python = ">=3.13"
-dependencies = ["httpx>=0.28,<0.29"]
+dependencies = ["httpx>=0.28,<0.29", "aiohttp>=3.14.3,<4"]
 
 [project.scripts]
 post-uploader = "post_uploader.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["post_uploader*"]
+
+[tool.setuptools.package-data]
+post_uploader = ["static/*.html", "static/*.js", "static/*.css"]
 
 [tool.ruff]
 target-version = "py313"

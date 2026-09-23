@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Review TikTok post</title>
+  <link rel="stylesheet" href="/publisher/tiktok.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="/publisher/tiktok.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>Review TikTok post</h1>
+  <p id="status" role="status">Loading account and video…</p>
+  <form id="post" hidden>
+    <p id="account"></p><p id="restriction"></p>
+    <video id="video" controls playsinline preload="metadata"></video>
+    <h2 id="title"></h2>
+    <label for="caption">Caption</label>
+    <textarea id="caption" rows="5" maxlength="800" required dir="auto"></textarea>
+    <label for="privacy">Who can watch this video?</label>
+    <select id="privacy" required><option value="">Choose visibility</option></select>
+    <fieldset><legend>Allow interactions</legend>
+      <label><input type="checkbox" id="allow_comment"> Comments <span id="comment_hint"></span></label>
+      <label><input type="checkbox" id="allow_duet"> Duet <span id="duet_hint"></span></label>
+      <label><input type="checkbox" id="allow_stitch"> Stitch <span id="stitch_hint"></span></label>
+    </fieldset>
+    <fieldset><legend>Content disclosures</legend>
+      <label><input type="checkbox" id="commercial_content"> This promotes a brand, product, or service</label>
+      <div id="brands" hidden>
+        <label><input type="checkbox" id="brand_organic_toggle"> Your brand</label>
+        <label><input type="checkbox" id="brand_content_toggle"> Branded content / paid partnership</label>
+      </div>
+      <p id="brand_label"></p>
+      <label><input type="checkbox" id="is_aigc"> The video contains AI-generated content</label>
+    </fieldset>
+    <label><input type="checkbox" id="consent" required> By posting, you agree to TikTok's
+      <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank" rel="noreferrer">Music Usage Confirmation</a><span id="branded_consent" hidden>
+      and <a href="https://www.tiktok.com/legal/page/global/bc-policy/en" target="_blank" rel="noreferrer">Branded Content Policy</a></span>.
+    </label>
+    <p id="validation" role="status"></p>
+    <button id="publish" type="submit" disabled>Publish</button>
+    <p>Processing can take a few minutes. The bot will report the result.</p>
+  </form>
+</main>
+</body></html>

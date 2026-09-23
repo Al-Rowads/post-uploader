@@ -23,6 +23,8 @@ services:
       YOUTUBE_CREDENTIALS_FILE: /credentials/youtube-credentials.json
       YOUTUBE_CLIENT_SECRETS_FILE: /credentials/youtube-client-secret.json
       TIKTOK_CREDENTIALS_FILE: /credentials/tiktok-credentials.json
+      WEB_BIND: 0.0.0.0
+      WEB_PORT: 8080
     depends_on:
       telegram-bot-api:
         condition: service_started

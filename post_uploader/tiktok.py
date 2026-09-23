@@ -38,7 +38,7 @@ def save_credentials(path: Path, payload: dict):
             os.unlink(temporary)
 
 
-def token_response(response: httpx.Response, previous: dict) -> dict:
+def token_response(response: httpx.Response, previous: dict, required_scope="video.upload") -> dict:
     try:
         payload = response.json()
         if response.is_error or not isinstance(payload, dict) or payload.get("error"):
@@ -46,7 +46,7 @@ def token_response(response: httpx.Response, previous: dict) -> dict:
         for key in ("access_token", "refresh_token", "open_id", "scope"):
             if not isinstance(payload.get(key), str) or not payload[key]:
                 raise ValueError
-        if "video.upload" not in payload["scope"].split(","):
+        if required_scope not in payload["scope"].split(","):
             raise ValueError
         if previous.get("open_id") and payload["open_id"] != previous["open_id"]:
             raise ValueError
@@ -55,7 +55,7 @@ def token_response(response: httpx.Response, previous: dict) -> dict:
                 raise ValueError
     except (ValueError, TypeError):
         raise RemoteError(
-            "TikTok token exchange failed; authorize video.upload again.", 401
+            f"TikTok token exchange failed; authorize {required_scope} again.", 401
         ) from None
     return dict(
         previous,
@@ -125,11 +125,11 @@ class TikTok:
             timeout=httpx.Timeout(120, connect=20), follow_redirects=False, trust_env=False
         )
 
-    async def credentials(self) -> dict:
+    async def credentials(self, required_scope="video.upload") -> dict:
         async with self.lock:
             saved = read_credentials(self.path)
-            if "video.upload" not in str(saved.get("scope", "")).split(","):
-                raise RemoteError("Authorize TikTok with the video.upload scope first.", 401)
+            if required_scope not in str(saved.get("scope", "")).split(","):
+                raise RemoteError(f"Authorize TikTok with the {required_scope} scope first.", 401)
             if saved.get("expires_at", 0) > time.time() + 300 and saved.get("access_token"):
                 return saved
             if saved.get("refresh_expires_at", 0) <= time.time() or not all(
@@ -145,19 +145,19 @@ class TikTok:
                     "refresh_token": saved["refresh_token"],
                 },
             )
-            saved = token_response(response, saved)
+            saved = token_response(response, saved, required_scope)
             save_credentials(self.path, saved)
             return saved
 
-    async def api(self, endpoint: str, *, data: dict | None = None) -> dict:
-        credentials = await self.credentials()
+    async def api(self, endpoint: str, *, data: dict | None = None, scope="video.upload") -> dict:
+        credentials = await self.credentials(scope)
         headers = {"Authorization": f"Bearer {credentials['access_token']}"}
         url = "https://open.tiktokapis.com/v2/" + endpoint
         async with self.request_lock:
             delay = self.next_request.get(endpoint, 0) - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
-            interval = 10.1 if endpoint.endswith("inbox/video/init/") else 2.1
+            interval = 10.1 if endpoint.endswith("video/init/") else 3.1
             self.next_request[endpoint] = time.monotonic() + interval
             response = (
                 await self.client.get(url, headers=headers)
@@ -174,7 +174,7 @@ class TikTok:
                 )
                 raise RemoteError(
                     f"TikTok request failed ({code}).",
-                    response.status_code,
+                    response.status_code if response.status_code >= 400 else 400,
                     3600 if response.status_code == 429 else 60,
                 )
             if not isinstance(payload.get("data"), dict):
@@ -186,7 +186,7 @@ class TikTok:
             ) from None
 
     async def account(self) -> dict:
-        data = await self.api("user/info/?fields=open_id,display_name")
+        data = await self.api("user/info/?fields=open_id,display_name", scope="user.info.basic")
         user = data.get("user")
         if not isinstance(user, dict) or not user.get("open_id"):
             raise RemoteError("TikTok account response is incomplete.", 401)
@@ -232,5 +232,99 @@ class TikTok:
                 if response.status_code != (201 if index == count - 1 else 206):
                     raise RemoteError("TikTok transfer interrupted; checking the existing upload.")
 
-    async def status(self, publish_id: str) -> dict:
-        return await self.api("post/publish/status/fetch/", data={"publish_id": publish_id})
+    async def status(self, publish_id: str, *, direct=False) -> dict:
+        return await self.api(
+            "post/publish/status/fetch/",
+            data={"publish_id": publish_id},
+            scope="video.publish" if direct else "video.upload",
+        )
+
+    async def creator_info(self) -> dict:
+        data = await self.api("post/publish/creator_info/query/", data={}, scope="video.publish")
+        options = data.get("privacy_level_options")
+        if (
+            not isinstance(options, list)
+            or not options
+            or any(
+                not isinstance(option, str) or option not in PRIVACY_LEVELS for option in options
+            )
+            or not isinstance(data.get("creator_nickname"), str)
+            or type(data.get("max_video_post_duration_sec")) is not int
+            or data["max_video_post_duration_sec"] <= 0
+            or any(
+                type(data.get(key)) is not bool
+                for key in ("comment_disabled", "duet_disabled", "stitch_disabled")
+            )
+        ):
+            raise RemoteError("TikTok creator information is incomplete.")
+        return data
+
+    async def initialize_direct(self, post_info: dict, video_url: str) -> dict:
+        data = await self.api(
+            "post/publish/video/init/",
+            scope="video.publish",
+            data={
+                "post_info": post_info,
+                "source_info": {"source": "PULL_FROM_URL", "video_url": video_url},
+            },
+        )
+        if not isinstance(data.get("publish_id"), str) or not data["publish_id"]:
+            raise RemoteError("TikTok did not return a Direct Post identifier.")
+        return data
+
+
+PRIVACY_LEVELS = {"PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "SELF_ONLY"}
+
+
+def direct_post_info(values: dict, creator: dict, mode: str) -> dict:
+    from .domain import validate_platform_caption
+
+    if mode not in {"private_test", "approved"}:
+        raise ValueError("TikTok Direct Post is disabled.")
+    if values.get("consent") is not True:
+        raise ValueError("Confirm TikTok publishing consent first.")
+    privacy = values.get("privacy_level")
+    if privacy not in creator["privacy_level_options"]:
+        raise ValueError("Choose one of the currently available privacy options.")
+    if mode == "private_test" and privacy != "SELF_ONLY":
+        raise ValueError("Unaudited mode only permits Only me on a private TikTok account.")
+    caption = validate_platform_caption(values.get("caption"))
+    fields = (
+        "allow_comment",
+        "allow_duet",
+        "allow_stitch",
+        "commercial_content",
+        "brand_organic_toggle",
+        "brand_content_toggle",
+        "is_aigc",
+    )
+    if any(type(values.get(key)) is not bool for key in fields):
+        raise ValueError("Select the interaction and content-disclosure settings.")
+    commercial = values["commercial_content"]
+    branded, own_brand = values["brand_content_toggle"], values["brand_organic_toggle"]
+    if commercial != (branded or own_brand):
+        raise ValueError("Commercial content requires Your brand, Branded content, or both.")
+    if branded and privacy == "SELF_ONLY":
+        raise ValueError("Branded content cannot use Only me visibility.")
+    result = {
+        "title": caption,
+        "privacy_level": privacy,
+        "brand_content_toggle": branded,
+        "brand_organic_toggle": own_brand,
+        "is_aigc": values["is_aigc"],
+    }
+    for interaction in ("comment", "duet", "stitch"):
+        enabled = values[f"allow_{interaction}"]
+        if enabled and creator[f"{interaction}_disabled"]:
+            raise ValueError(f"TikTok has disabled {interaction}; refresh the form.")
+        result[f"disable_{interaction}"] = not enabled
+    return result
+
+
+def direct_outcome(data: dict, privacy: str) -> Outcome:
+    if data.get("status") == "PUBLISH_COMPLETE" and privacy != "PUBLIC_TO_EVERYONE":
+        return Outcome("needs_action", f"TikTok posted with the selected visibility: {privacy}.")
+    outcome = draft_outcome(data)
+    if outcome.state == "pending":
+        return Outcome("pending", "TikTok is processing the post.")
+    return outcome

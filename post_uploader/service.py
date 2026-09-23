@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import shutil
 import time
 from pathlib import Path
 
@@ -11,26 +10,29 @@ from .clients import Publisher, RemoteError, Telegram
 from .config import Config
 from .database import Database
 from .domain import TERMINAL_DESTINATIONS, Outcome, outcome_from_result, result_list
-from .media import MediaError, inspect_video, safe_media_path
-from .tiktok import TikTok, draft_outcome
+from .media import MediaError, safe_media_path
+from .openrouter import OpenRouter
+from .review import ReviewWorkflow
+from .tiktok import TikTok, direct_outcome, direct_post_info, draft_outcome
+from .web import PublishingWeb
 from .youtube import YouTube, upload_metadata, upload_outcome, uploaded_offset
 
 logger = logging.getLogger(__name__)
 
-HELP = """Send a video with a caption to upload to YouTube Shorts and send a draft to TikTok.
-YouTube Shorts: square or vertical, up to 180 seconds. Ineligible videos must be edited and resent.
-The bot uploads original files; YouTube determines Shorts classification after processing.
-First caption line: YouTube title (up to 100 characters).
-Full caption: YouTube description; copy it into TikTok when finishing the draft.
-Open the TikTok inbox notification to add captions, disclosures, and public visibility.
-Each album item is a separate post and needs its own caption.
-If prompted, reply to the job message or original video with the missing caption.
+HELP = """Send a video, then reply with a title and a master caption.
+The bot generates a caption and sends a separate preview for every active platform.
+Accept publishes that version. TikTok Accept opens its settings and final Publish form.
+Reject lets you replace only that platform's caption or video. Reply to the replacement prompt.
+Videos are not cropped or transcoded.
+YouTube Shorts must be square/vertical and at most 180 seconds.
+Video documents stay documents in Telegram. Each album item is a separate job.
 
-/status [job_id] — queue and platform results
-/retry <job_id> — retry confirmed failures or recheck an uncertain submission
-/cancel <job_id> — cancel before submission
-/pause — stop new uploads (active submissions continue)
-/resume — resume automatic uploads
+/platforms — choose platforms for future videos
+/status [job_id] — review progress and platform results
+/retry <job_id> — retry captions, review failures, or recheck saved submission IDs
+/cancel <job_id> — cancel destinations not yet submitted
+/pause — stop new publications (active submissions continue)
+/resume — resume approved publications
 /help — show these instructions"""
 
 
@@ -44,8 +46,13 @@ class Service:
         self.youtube = YouTube(config.youtube_credentials_file)
         self.uploads_in_flight: set[str] = set()
         self.last_cleanup = 0.0
+        self.openrouter = OpenRouter(config)
+        self.review = ReviewWorkflow(self)
+        self.web = PublishingWeb(self)
 
     async def close(self):
+        await self.web.close()
+        await self.openrouter.client.aclose()
         await self.telegram.client.aclose()
         await self.publisher.client.aclose()
         await self.tiktok.client.aclose()
@@ -64,54 +71,15 @@ class Service:
         if text.startswith("/"):
             self.command(chat_id, text)
             return
-        media = message.get("video") or message.get("document")
-        if media:
-            existing = self.db.execute(
-                "SELECT id FROM jobs WHERE chat_id=? AND message_id=?",
-                (chat_id, message["message_id"]),
-            ).fetchone()
-            if existing:
-                if "edited_message" in update:
-                    self.db.notify(
-                        chat_id,
-                        self.db.caption(existing[0], message.get("caption", "")),
-                        existing[0],
-                    )
-                return
-            size = media.get("file_size")
-            if not isinstance(size, int) or size <= 0 or size > self.config.max_video_bytes:
-                self.db.notify(
-                    chat_id,
-                    "Video needs a known, nonzero size of at most "
-                    f"{self.config.max_video_bytes:,} bytes.",
-                )
-                return
-            pending = self.db.execute(
-                "SELECT COUNT(*) FROM jobs WHERE state NOT IN ('settled','cancelled')"
-            ).fetchone()[0]
-            if pending >= self.config.max_pending_jobs:
-                self.db.notify(chat_id, "Queue is full. Let existing jobs finish before resending.")
-                return
-            self.db.create_job(message, media, self.config.declarations)
-            return
-        reply = message.get("reply_to_message", {}).get("message_id")
-        if reply and text:
-            job = self.db.execute(
-                "SELECT id FROM jobs WHERE chat_id=? AND message_id=? UNION "
-                "SELECT job_id FROM outbox WHERE chat_id=? AND sent_message_id=? "
-                "AND job_id IS NOT NULL LIMIT 1",
-                (chat_id, reply, chat_id, reply),
-            ).fetchone()
-            if job:
-                self.db.notify(chat_id, self.db.caption(job[0], text), job[0])
-                return
-        self.db.notify(chat_id, "Send a video with a caption, or use /help.")
+        self.review.handle_message(message, edited="edited_message" in update)
 
     def command(self, chat_id: int, text: str):
         arguments = text.split()
         command = arguments[0].split("@")[0].lower()
         if command in {"/start", "/help"}:
             self.db.notify(chat_id, f"YouTube visibility: {self.config.youtube_privacy}\n\n{HELP}")
+        elif command == "/platforms":
+            self.review.platform_menu(chat_id)
         elif command in {"/pause", "/resume"}:
             paused = command == "/pause"
             self.db.set_setting("paused", str(paused).lower())
@@ -119,7 +87,7 @@ class Service:
                 chat_id,
                 "New uploads paused. Active submissions will finish."
                 if paused
-                else "Automatic uploads resumed.",
+                else "Approved publications resumed.",
             )
         elif command == "/status" and len(arguments) == 1:
             jobs = self.db.execute("SELECT id FROM jobs ORDER BY id DESC LIMIT 10").fetchall()
@@ -148,11 +116,15 @@ class Service:
             try:
                 updates = await self.telegram.get_updates(int(self.db.get_setting("offset")))
                 for update in updates:
-                    with self.db.transaction():
-                        if update["update_id"] < int(self.db.get_setting("offset")):
-                            continue
-                        self.handle_update(update)
+                    if update["update_id"] < int(self.db.get_setting("offset")):
+                        continue
+                    if "callback_query" in update:
+                        await self.review.callback(update["callback_query"])
                         self.db.set_setting("offset", str(update["update_id"] + 1))
+                    else:
+                        with self.db.transaction():
+                            self.handle_update(update)
+                            self.db.set_setting("offset", str(update["update_id"] + 1))
                 self.db.set_setting("ingest_heartbeat", str(time.time()))
             except (httpx.HTTPError, RemoteError) as error:
                 logger.warning("Telegram polling unavailable (%s)", type(error).__name__)
@@ -161,18 +133,17 @@ class Service:
     async def deliver_notifications(self):
         while True:
             row = self.db.execute(
-                "SELECT * FROM outbox WHERE sent_message_id IS NULL "
-                "AND next_try<=? ORDER BY id LIMIT 1",
+                "SELECT * FROM outbox WHERE done=0 AND next_try<=? ORDER BY id LIMIT 1",
                 (time.time(),),
             ).fetchone()
             if row:
                 try:
-                    result = await self.telegram.send(row["chat_id"], row["body"])
+                    result = await self.review.deliver(row)
                     self.db.execute(
-                        "UPDATE outbox SET sent_message_id=? WHERE id=?",
-                        (result["message_id"], row["id"]),
+                        "UPDATE outbox SET sent_message_id=?,done=1 WHERE id=?",
+                        (result["message_id"] if result else None, row["id"]),
                     )
-                except (httpx.HTTPError, RemoteError) as error:
+                except (httpx.HTTPError, RemoteError, OSError) as error:
                     delay = error.retry_after if isinstance(error, RemoteError) else 30
                     self.db.execute(
                         "UPDATE outbox SET next_try=? WHERE id=?", (time.time() + delay, row["id"])
@@ -200,83 +171,152 @@ class Service:
 
     async def prepare(self, job):
         job_id = job["id"]
-        if shutil.disk_usage(self.config.telegram_files).free < (
-            job["file_size"] + self.config.disk_reserve_bytes
-        ):
-            self.defer(job_id, "Download delayed: insufficient free media storage.", 600)
-            return
-        path = None
-        if job["local_path"]:
-            try:
-                path = safe_media_path(Path(job["local_path"]), self.config.telegram_files)
-            except FileNotFoundError:
-                pass
-        if path is None:
-            path = safe_media_path(
-                await self.telegram.download(job["file_id"]), self.config.telegram_files
-            )
-            self.db.execute(
-                "UPDATE jobs SET local_path=?,media_saved_at=? WHERE id=?",
-                (str(path), time.time(), job_id),
-            )
-        if self.db.job(job_id)["state"] == "cancelled":
-            return
-        video = await inspect_video(path, job["file_size"], self.config.max_video_bytes)
-        if self.db.job(job_id)["state"] == "cancelled":
-            return
-        for platform in ("youtube", "tiktok"):
-            current = self.db.job(job_id)
-            if current["state"] == "cancelled":
-                return
-            if self.db.get_setting("paused") == "true":
-                self.db.execute("UPDATE jobs SET state='queued' WHERE id=?", (job_id,))
-                return
-            destination = next(
-                row for row in self.db.destinations(job_id) if row["platform"] == platform
-            )
-            if destination["state"] != "ready":
+        for destination in self.db.destinations(job_id):
+            platform = destination["platform"]
+            if destination["state"] != "ready" or not destination["approved"]:
                 continue
+            if self.db.get_setting("paused") == "true":
+                break
             try:
+                path, video = await self.review.ensure_media(destination["media_id"])
+                publication = self.db.publication(job_id, platform)
                 if platform == "youtube":
                     if reason := video.youtube_shorts_error():
-                        self.db.outcome(job_id, platform, Outcome("invalid", reason))
-                        continue
+                        raise MediaError(reason)
+                    if len(json.loads(publication["declarations"])) != 3:
+                        raise RemoteError(
+                            "Configure all three YouTube declarations before uploading.", 400
+                        )
                     await self.youtube.credentials()
-                    if self.db.job(job_id)["state"] == "cancelled":
-                        return
-                    if self.db.get_setting("paused") == "true":
-                        self.db.execute("UPDATE jobs SET state='queued' WHERE id=?", (job_id,))
-                        return
-                    await self.submit_youtube(job, path)
+                elif platform == "telegram":
+                    channel_id = publication["settings"].get("chat_id")
+                    if not channel_id:
+                        raise RemoteError(
+                            "Enable Telegram through /platforms to select a channel.", 400
+                        )
+                    await self.telegram.channel(channel_id)
                 else:
-                    if reason := video.tiktok_error(600):
-                        self.db.outcome(job_id, platform, Outcome("invalid", reason))
-                        continue
-                    await self.tiktok.credentials()
-                    if self.db.job(job_id)["state"] == "cancelled":
-                        return
-                    if self.db.get_setting("paused") == "true":
-                        self.db.execute("UPDATE jobs SET state='queued' WHERE id=?", (job_id,))
-                        return
-                    mime = "video/webm" if "webm" in video.format.split(",") else "video/mp4"
-                    await self.submit_tiktok(job, path, video.size, mime)
-            except (RemoteError, httpx.HTTPError, OSError) as error:
-                # A platform preflight failure must not block the other destination.
+                    self.review.check_direct_config()
+                    await self.review.check_tiktok_identity("video.publish")
+                    creator = await self.tiktok.creator_info()
+                    if reason := video.tiktok_error(creator["max_video_post_duration_sec"]):
+                        raise MediaError(reason)
+                    publication["settings"]["post_info"] = direct_post_info(
+                        publication["settings"].get("form_values", {}),
+                        creator,
+                        self.config.tiktok_direct_mode,
+                    )
+                # Commands and callbacks may run while network/media preflight is awaiting.
+                current = self.db.destination(job_id, platform)
+                if (
+                    current["state"] != "ready"
+                    or current["revision"] != destination["revision"]
+                    or self.db.get_setting("paused") == "true"
+                ):
+                    continue
+                if platform == "youtube":
+                    await self.submit_youtube(publication, path)
+                elif platform == "telegram":
+                    await self.submit_telegram(publication)
+                else:
+                    await self.submit_tiktok_direct(publication)
+            except (MediaError, RemoteError, httpx.HTTPError, OSError, ValueError) as error:
+                current = self.db.destination(job_id, platform)
+                if current["state"] != "ready":
+                    continue
                 message = (
                     str(error)
-                    if isinstance(error, RemoteError)
-                    else "Account preflight unavailable; /retry."
+                    if isinstance(error, (ValueError, RemoteError))
+                    else ("Media/account preflight unavailable; /retry.")
                 )
-                self.db.outcome(job_id, platform, Outcome("failed", message))
+                self.db.outcome(
+                    job_id,
+                    platform,
+                    Outcome(
+                        "invalid" if isinstance(error, MediaError) else "failed",
+                        self.config.redact(message),
+                    ),
+                )
+        self.db.execute(
+            "UPDATE jobs SET state='reviewing' WHERE id=? AND state='preparing'", (job_id,)
+        )
         self.db.queue_remaining_destinations()
         self.db.finish_if_terminal(job_id)
         self.db.notify(job["chat_id"], self.db.summarize(job_id), job_id)
+
+    async def submit_telegram(self, publication):
+        job_id = publication["id"]
+        request_id = self.db.prepare_attempt(job_id, ["telegram"], "telegram", publication)
+        self.uploads_in_flight.add(request_id)
+        outcome = Outcome(
+            "unknown",
+            "Telegram delivery is uncertain. Inspect the channel; "
+            "this post will not be automatically resent.",
+        )
+        try:
+            result = await self.telegram.send_media(
+                publication["settings"]["chat_id"],
+                publication,
+                publication["caption"],
+            )
+            if (
+                isinstance(result, dict)
+                and type(result.get("message_id")) is int
+                and isinstance(result.get("chat"), dict)
+                and result.get("chat", {}).get("id") == publication["settings"]["chat_id"]
+            ):
+                message_id = result["message_id"]
+                username = publication["settings"].get("username")
+                url = f"https://t.me/{username}/{message_id}" if username else None
+                outcome = Outcome(
+                    "published", "Published to the Telegram channel.", url, str(message_id)
+                )
+        except RemoteError as error:
+            if error.status in {400, 401, 403, 404, 413, 429}:
+                outcome = Outcome("failed", self.config.redact(str(error)))
+        except (httpx.HTTPError, OSError):
+            pass
+        finally:
+            self.uploads_in_flight.discard(request_id)
+        self.db.outcome(job_id, "telegram", outcome)
+        self.db.execute(
+            "UPDATE attempts SET state=? WHERE request_id=?",
+            ("unknown" if outcome.state == "unknown" else "done", request_id),
+        )
+
+    async def submit_tiktok_direct(self, publication):
+        job_id = publication["id"]
+        request_id = self.db.prepare_attempt(job_id, ["tiktok"], "tiktok_direct", publication)
+        self.uploads_in_flight.add(request_id)
+        url = self.web.media_link(
+            job_id, publication["media_id"], publication["revision"], "publish"
+        )
+        try:
+            result = await self.tiktok.initialize_direct(publication["settings"]["post_info"], url)
+            self.db.execute(
+                "UPDATE attempts SET publish_id=? WHERE request_id=?",
+                (result["publish_id"], request_id),
+            )
+        except RemoteError as error:
+            if error.status in {400, 401, 403, 404, 413, 415, 422, 429}:
+                self.db.execute(
+                    "UPDATE attempts SET state='rejected' WHERE request_id=?", (request_id,)
+                )
+                self.db.outcome(job_id, "tiktok", Outcome("failed", str(error)))
+            else:
+                self.submission_uncertain(job_id)
+        except (httpx.HTTPError, OSError):
+            self.submission_uncertain(job_id)
+        finally:
+            self.uploads_in_flight.discard(request_id)
 
     async def submit_youtube(self, job, path):
         metadata = upload_metadata(
             job, json.loads(job["declarations"]), self.config.youtube_privacy
         )
-        request_id = self.db.prepare_attempt(job["id"], ["youtube"], provider="youtube")
+        request_id = self.db.prepare_attempt(
+            job["id"], ["youtube"], provider="youtube", snapshot=dict(job)
+        )
         self.uploads_in_flight.add(request_id)
         try:
             session = await self.youtube.initialize(metadata, path.stat().st_size)
@@ -304,7 +344,7 @@ class Service:
 
     async def reconcile_youtube(self, attempt):
         request_id, job_id = attempt["request_id"], attempt["job_id"]
-        job = self.db.job(job_id)
+        job = json.loads(attempt["snapshot"]) if attempt["snapshot"] else dict(self.db.job(job_id))
         outcome = None
         if not attempt["session_uri"]:
             outcome = Outcome("failed", "YouTube session was not saved; no media was sent. /retry.")
@@ -399,8 +439,8 @@ class Service:
                 Outcome(
                     "unknown",
                     "TikTok initialization response was lost. "
-                    "No video bytes were sent. This request cannot be looked up by client ID; "
-                    "it will not be automatically uploaded again.",
+                    "Inspect TikTok before further action. This request cannot be looked up by "
+                    "client ID and will not be automatically submitted again.",
                 ),
             )
             self.db.notify(self.db.job(job_id)["chat_id"], self.db.summarize(job_id), job_id)
@@ -410,7 +450,15 @@ class Service:
             "UPDATE attempts SET next_poll=?,polls=polls+1 WHERE request_id=?",
             (now + 30, request_id),
         )
-        outcome = draft_outcome(await self.tiktok.status(attempt["publish_id"]))
+        direct = attempt["provider"] == "tiktok_direct"
+        await self.review.check_tiktok_identity("video.publish" if direct else "video.upload")
+        data = await self.tiktok.status(attempt["publish_id"], direct=direct)
+        snapshot = json.loads(attempt["snapshot"] or "{}")
+        outcome = (
+            direct_outcome(data, snapshot["settings"]["post_info"]["privacy_level"])
+            if direct
+            else draft_outcome(data)
+        )
         current = next(row for row in self.db.destinations(job_id) if row["platform"] == "tiktok")
         if current["state"] == "published" or (
             current["state"] == "needs_action" and outcome.state == "pending"
@@ -425,7 +473,7 @@ class Service:
             self.db.outcome(job_id, "tiktok", outcome)
             if outcome.state != "pending":
                 self.db.notify(self.db.job(job_id)["chat_id"], self.db.summarize(job_id), job_id)
-                if outcome.state == "needs_action":
+                if outcome.state == "needs_action" and not direct:
                     self.db.notify(
                         self.db.job(job_id)["chat_id"],
                         "Copy this caption when finishing the TikTok draft:\n\n"
@@ -447,6 +495,7 @@ class Service:
     async def worker(self):
         while True:
             self.db.set_setting("worker_heartbeat", str(time.time()))
+            await self.review.tick()
             if self.db.get_setting("paused") != "true":
                 job = self.db.execute(
                     "SELECT * FROM jobs WHERE state='queued' AND next_run<=? ORDER BY id LIMIT 1",
@@ -492,9 +541,9 @@ class Service:
             if platform not in platforms:
                 continue
             outcome = outcome_from_result(result, platform, history=history)
-            current = next(
-                row for row in self.db.destinations(job_id) if row["platform"] == platform
-            )
+            current = self.db.destination(job_id, platform)
+            if current is None:
+                continue
             if current["state"] in {"published", "needs_action"} and outcome.state not in {
                 "published",
                 "needs_action",
@@ -520,7 +569,24 @@ class Service:
         if attempt["provider"] == "youtube":
             await self.reconcile_youtube(attempt)
             return
-        if attempt["provider"] == "tiktok":
+        if attempt["provider"] == "telegram":
+            self.db.outcome(
+                attempt["job_id"],
+                "telegram",
+                Outcome(
+                    "unknown", "Telegram delivery was interrupted. Inspect the channel; no resend."
+                ),
+            )
+            self.db.execute(
+                "UPDATE attempts SET state='unknown' WHERE request_id=?", (attempt["request_id"],)
+            )
+            self.db.notify(
+                self.db.job(attempt["job_id"])["chat_id"],
+                self.db.summarize(attempt["job_id"]),
+                attempt["job_id"],
+            )
+            return
+        if attempt["provider"] in {"tiktok", "tiktok_direct"}:
             await self.reconcile_tiktok(attempt)
             return
         request_id, job_id = attempt["request_id"], attempt["job_id"]
@@ -601,43 +667,56 @@ class Service:
 
     def cleanup(self):
         cutoff = time.time() - self.config.media_retention_hours * 3600
-        jobs = self.db.execute(
-            "SELECT * FROM jobs WHERE local_path IS NOT NULL AND state!='preparing'"
+        self.db.execute("DELETE FROM media_links WHERE expires_at<=?", (time.time(),))
+        media_rows = self.db.execute(
+            "SELECT * FROM media_assets WHERE local_path IS NOT NULL "
+            "AND COALESCE(saved_at,created_at)<?",
+            (cutoff,),
         ).fetchall()
-        for job in jobs:
-            destinations = self.db.destinations(job["id"])
-            completed = all(row["state"] == "published" for row in destinations)
+        for media in media_rows:
+            # Paths may be shared across Telegram file IDs and across destination versions.
+            referenced = self.db.execute(
+                "SELECT 1 FROM destinations d JOIN media_assets m ON d.media_id=m.id "
+                "JOIN jobs j ON j.id=d.job_id WHERE m.local_path=? "
+                "AND (j.state NOT IN ('settled','cancelled') OR d.state IN ('pending','unknown'))",
+                (media["local_path"],),
+            ).fetchone()
+            links = self.db.execute(
+                "SELECT 1 FROM media_links l JOIN media_assets m "
+                "ON m.id=l.media_id WHERE m.local_path=?",
+                (media["local_path"],),
+            ).fetchone()
+            attempts = self.db.execute(
+                "SELECT snapshot FROM attempts WHERE state IN ('tracking','unknown')"
+            ).fetchall()
             if (
-                job["state"] != "cancelled"
-                and not completed
-                and (job["media_saved_at"] or job["created_at"]) > cutoff
+                referenced
+                or links
+                or any(
+                    json.loads(a[0] or "{}").get("local_path") == media["local_path"]
+                    for a in attempts
+                )
             ):
                 continue
-            if self.db.execute(
-                "SELECT 1 FROM attempts WHERE job_id=? AND state='tracking'", (job["id"],)
-            ).fetchone():
-                continue
-            if self.db.execute(
-                "SELECT 1 FROM jobs WHERE local_path=? AND id!=? "
-                "AND (state='preparing' OR id IN (SELECT job_id FROM attempts "
-                "WHERE state='tracking'))",
-                (job["local_path"], job["id"]),
-            ).fetchone():
-                continue
             try:
-                safe_media_path(Path(job["local_path"]), self.config.telegram_files).unlink()
+                safe_media_path(Path(media["local_path"]), self.config.telegram_files).unlink()
             except FileNotFoundError:
                 pass
             except (OSError, MediaError):
-                logger.warning("Could not clean media for job %s", job["id"])
+                logger.warning("Could not clean media asset %s", media["id"])
                 continue
             self.db.execute(
-                "UPDATE jobs SET local_path=NULL WHERE local_path=?", (job["local_path"],)
+                "UPDATE media_assets SET local_path=NULL WHERE local_path=?", (media["local_path"],)
+            )
+            self.db.execute(
+                "UPDATE jobs SET local_path=NULL WHERE local_path=?", (media["local_path"],)
             )
 
     async def run(self):
         self.db.recover()
         await self.telegram.call("getMe")
+        if self.config.tiktok_direct_mode != "disabled":
+            await self.web.start()
         await self.telegram.call("deleteWebhook", drop_pending_updates=False)
         self.db.notify(
             self.config.owner_id,
@@ -645,7 +724,7 @@ class Service:
             + (
                 "Uploads remain paused."
                 if self.db.get_setting("paused") == "true"
-                else "Review YouTube uploads in Studio and finish TikTok drafts in TikTok."
+                else "Send a video to start a review, or use /platforms."
             ),
         )
         async with asyncio.TaskGroup() as tasks:

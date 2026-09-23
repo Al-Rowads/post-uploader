@@ -94,6 +94,7 @@ class MigrationTests(unittest.TestCase):
                     "INSERT INTO attempts VALUES ('original',1,'[\"youtube\",\"tiktok\"]',"
                     "'tracking',1,1,7)"
                 )
+            connection.close()
             database = Database(path)
             try:
                 attempt = database.execute("SELECT * FROM attempts").fetchone()
@@ -104,36 +105,38 @@ class MigrationTests(unittest.TestCase):
             finally:
                 database.connection.close()
 
-    def test_v1_migration_preserves_old_provider_and_recovers_remaining_destination(self):
+    def test_v1_migration_preserves_attempt_and_requires_review_for_unsent_platform(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "jobs.sqlite3"
-            with sqlite3.connect(path) as connection:
-                connection.executescript(SCHEMA)
-                connection.execute("PRAGMA user_version = 1")
+            connection = sqlite3.connect(path)
+            connection.executescript(SCHEMA)
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute(
+                "INSERT INTO jobs(id,chat_id,message_id,file_id,file_unique_id,filename,file_size,"
+                "caption,title,declarations,state,created_at,updated_at) "
+                "VALUES (1,1,1,'source','source','video.mp4',100,'Original caption','Title',"
+                "'{}','submitted',1,1)"
+            )
+            connection.execute(
+                "INSERT INTO destinations(job_id,platform,state) VALUES "
+                "(1,'youtube','pending'),(1,'tiktok','ready')"
+            )
+            connection.execute(
+                "INSERT INTO attempts VALUES ('original',1,'[\"youtube\"]','tracking',1,1,7)"
+            )
+            connection.commit()
+            connection.close()
             database = Database(path)
             try:
-                message = {"chat": {"id": 1}, "message_id": 1, "caption": "Migration test"}
-                media = {"file_id": "", "file_unique_id": "", "file_size": 1}
-                job = database.create_job(message, media, {})
-                youtube = database.prepare_attempt(job, ["youtube"])
                 database.recover()
-                self.assertEqual(database.job(job)["state"], "queued")
-                states = {row["platform"]: row["state"] for row in database.destinations(job)}
-                self.assertEqual(states, {"youtube": "pending", "tiktok": "ready"})
-                tiktok = database.prepare_attempt(job, ["tiktok"], "tiktok")
-                database.execute(
-                    "UPDATE attempts SET publish_id='saved-id' WHERE request_id=?", (tiktok,)
-                )
-                database.connection.close()
-                database = Database(path)
-                database.recover()
-                self.assertEqual(database.job(job)["state"], "submitted")
-                attempts = {
-                    row["request_id"]: row for row in database.execute("SELECT * FROM attempts")
-                }
-                self.assertEqual(attempts[youtube]["provider"], "upload_post")
-                self.assertEqual(attempts[tiktok]["provider"], "tiktok")
-                self.assertEqual(attempts[tiktok]["publish_id"], "saved-id")
-                self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 3)
+                attempt = database.execute("SELECT * FROM attempts").fetchone()
+                self.assertEqual(attempt["request_id"], "original")
+                self.assertEqual(attempt["provider"], "upload_post")
+                self.assertEqual(attempt["polls"], 7)
+                self.assertEqual(database.destination(1, "tiktok")["state"], "review")
+                self.assertEqual(database.destination(1, "tiktok")["caption"], "Original caption")
+                self.assertEqual(database.execute("PRAGMA user_version").fetchone()[0], 4)
+                with self.assertRaises(ValueError):
+                    database.prepare_attempt(1, ["tiktok"], "tiktok_direct")
             finally:
                 database.connection.close()

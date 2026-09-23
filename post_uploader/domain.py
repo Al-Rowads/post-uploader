@@ -2,8 +2,34 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
-PLATFORMS = ("youtube", "tiktok")
+PLATFORMS = ("youtube", "tiktok", "telegram")
+PLATFORM_LABELS = {"youtube": "YouTube Shorts", "tiktok": "TikTok", "telegram": "Telegram"}
+CAPTION_LIMIT = 800
 TERMINAL_DESTINATIONS = {"published", "failed", "invalid", "needs_action", "cancelled"}
+
+
+def text_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def validate_title(text: str) -> str:
+    text = text.strip()
+    if not text or "\n" in text or text_length(text) > 100 or "<" in text or ">" in text:
+        raise ValueError("Send a single-line title of 1–100 characters, without < or >.")
+    return text
+
+
+def validate_platform_caption(text: str) -> str:
+    if not isinstance(text, str) or not text.strip() or text_length(text) > CAPTION_LIMIT:
+        raise ValueError(f"Send a nonempty caption of at most {CAPTION_LIMIT} characters.")
+    return text
+
+
+def review_caption(job, destination) -> str:
+    return (
+        f"{PLATFORM_LABELS[destination['platform']]} · Job #{job['id']}\n"
+        f"Title: {job['title']}\n\n{destination['caption']}"
+    )
 
 
 def parse_caption(caption: str) -> tuple[str, str]:

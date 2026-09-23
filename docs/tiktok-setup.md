@@ -1,100 +1,86 @@
-# Native TikTok draft uploads
+# Native TikTok Direct Post
 
-## Current setup — September 13, 2026
+The repository supports gated Direct Post and continues reconciling historical inbox drafts.
+New TikTok destinations require Direct Post; there is no automatic fallback to inbox delivery.
 
-- App: **Level13 Publisher**, individually owned, ID `7684853871059372050`.
-- Sandbox: **Level13 Draft Uploads**, ID `7684813967113701394`.
-- [Developer app](https://developers.tiktok.com/app/7684853871059372050/pending).
-- [Sandbox](https://developers.tiktok.com/app/7684853871059372050/sandbox/7684813967113701394).
-- Saved sandbox settings: Login Kit, Content Posting API, Desktop, and Photo & Video.
-- Scopes: `user.info.basic` and `video.upload`. Direct Post is off.
-- Desktop redirect URI: `http://127.0.0.1:8765/callback/`.
-- Website: `https://upload.al-rowads.com/`.
-- Terms: `https://upload.al-rowads.com/terms/`.
-- Privacy: `https://upload.al-rowads.com/privacy/`.
-- The 1024×1024 app icon and all required URLs are saved. The URLs are live over HTTPS on the requested server.
-- Real sandbox app credentials are saved in gitignored `data/tiktok-credentials.json`, mode 0600.
-- Target account **@al.rowads** is registered in the sandbox.
-- OAuth consent completed with `user.info.basic` and `video.upload`; access and refresh tokens
-  are saved in the credential file. The live basic-profile API check returned `al.rowads`
-  and verified draft-upload scope on September 13, 2026.
-- No video has been uploaded. Production has not been submitted for review.
+## Existing account history
 
-The app description entered is: “Send original videos from a private Telegram bot to your
-TikTok inbox for review, editing, and manual publication.” Do not describe this as a public
-multi-user service unless the application actually becomes one.
+The September 13, 2026 setup recorded the **Level13 Publisher** app and **Level13 Draft Uploads**
+sandbox, with `user.info.basic` and `video.upload` authorized for **@al.rowads**. Direct Post was
+off, production review had not been submitted, and no real video was uploaded. Those checks
+do not establish current token validity or Direct Post access.
 
-TikTok's [app review rules](https://developers.tiktok.com/docs/en/app-review-guidelines) exclude
-personal-use apps. [Sandbox mode](https://developers.tiktok.com/docs/en/add-a-sandbox) supports
-testing but does not provide public-video access. The draft endpoint does not remove those
-approval requirements. Production availability and public posting from this app are unverified.
+- [Developer app](https://developers.tiktok.com/app/7684853871059372050/pending)
+- [Sandbox](https://developers.tiktok.com/app/7684853871059372050/sandbox/7684813967113701394)
+- Desktop OAuth redirect: `http://127.0.0.1:8765/callback/`
+- Website: `https://upload.al-rowads.com/`
 
-## Finish developer configuration
+Do not describe this owner-only utility as a public multi-user product. TikTok's
+[content sharing guidelines](https://developers.tiktok.com/docs/en/content-sharing-guidelines)
+exclude private account-upload utilities from the intended use of public Direct Post.
+An unaudited client requires a private account and `SELF_ONLY` visibility. Building this
+adapter does not grant app approval.
 
-1. Website deployment is complete at `https://upload.al-rowads.com`. See [server operations](../deploy/README.md).
-2. Target registration and upload OAuth consent for **@al.rowads** are complete.
-3. Use the OAuth helper below only when renewing or replacing authorization; stop the worker first.
-4. Complete any requested ownership verification. Production review is separate; sandbox
-   credentials are not production credentials.
+## Configure Direct Post
 
-## Authorize on this Mac
+1. Enable Direct Post in an eligible TikTok app/sandbox and obtain access to `video.publish`.
+   Keep the original account and desktop callback settings. Preserve `video.upload` access
+   while historical inbox attempts still need reconciliation.
+2. Stop the worker, then run the authorization helper:
 
-Run from the repository using its existing virtual environment:
+   ```sh
+   .venv/bin/python -m post_uploader.tiktok_auth authorize --mode direct
+   .venv/bin/python -m post_uploader.tiktok_auth check --mode direct
+   ```
 
-```sh
-.venv/bin/python -m post_uploader.tiktok_auth authorize --credentials data/tiktok-credentials.json
-```
+   The direct authorization request includes `user.info.basic`, `video.upload`, and
+   `video.publish`. The helper verifies state and desktop PKCE, then atomically saves tokens
+   with private permissions. The check reads creator capabilities without submitting media.
+   Use `--mode draft` only to maintain legacy inbox authorization.
+3. Deploy the bot's `/publisher/` routes and update both Nginx configurations described in
+   [server operations](../deploy/README.md). Configure the HTTPS `PUBLIC_SITE_URL` origin.
+   Register the HTTPS domain for the bot's Mini App in BotFather if Telegram requests it.
+4. Verify ownership of that domain or its `/publisher/media/` URL prefix in TikTok's developer
+   console. Complete its verification-file or DNS challenge through the configured website.
+   Do not expose a repository directory or credential files to satisfy verification.
+5. Set `TIKTOK_MEDIA_VERIFIED=true` only after verification succeeds. Set
+   `TIKTOK_DIRECT_MODE=private_test` for unaudited testing. Use `approved` only with a genuinely
+   audited, eligible app. The mode never changes account privacy or upgrades app permissions.
+6. Run `doctor`, restart the worker, and enable TikTok with `/platforms`. An API gate failure
+   is reported without preventing YouTube or Telegram from operating.
 
-Open the printed URL in Safari. The helper listens only on `127.0.0.1:8765`, checks a random
-state value, uses TikTok's documented desktop PKCE encoding, and waits up to ten minutes.
-Grant the displayed permissions to the intended TikTok account. The callback must exactly
-match the registered URI, including the final slash. The code exchange saves credentials
-atomically with owner-only permissions. It never prints tokens.
+The running server is the source of truth for refresh tokens after deployment. Stop the worker
+before replacing its credential file and keep its directory writable by UID/GID 101. Do not
+copy older local tokens over newer server credentials.
 
-Then run the read-only account check:
+## Per-post behavior
 
-```sh
-.venv/bin/python -m post_uploader.tiktok_auth check --credentials data/tiktok-credentials.json
-```
+The bot sends the TikTok video and generated caption alongside the other platform previews.
+Accept opens the Mini App. It displays the current account, video, editable caption, a privacy
+dropdown without a selected default, interaction controls initially off, commercial disclosures,
+and AI-video disclosure. Interactions disabled by TikTok cannot be enabled in the form.
+Branded content cannot use Only me visibility.
 
-This verifies account access, not upload delivery or production approval. A failed exchange
-does not create fallback tokens. The worker refreshes expiring tokens and saves any rotated
-refresh token. Stop the worker before reauthorizing against its credential file.
+The owner must confirm the displayed music/content terms and press Publish. The server
+validates Telegram's signed initialization data, owner identity, form age, destination revision,
+creator capabilities, and media eligibility. Changing a caption or video invalidates older
+forms. A replacement sent through the bot still requires TikTok's final form.
 
-## Install credentials for the worker
+The bot uses the documented server-media `PULL_FROM_URL` workflow with a random expiring URL.
+The URL permits only the selected file; it does not expose filesystem browsing. It remains
+available during TikTok's download window and supports HEAD/range requests. Treat these URLs
+as bearer credentials: both Nginx layers suppress logs for the publishing route.
 
-The local `.env` already points to `data/tiktok-credentials.json` using an absolute Mac path.
-Compose mounts `./data` at `/credentials` and overrides the credential path for the container.
-On the Linux server, both the directory and file must be writable by UID/GID 101, with modes
-0700 and 0600. The parent must be writable for atomic token refresh. Do not use a read-only mount.
-Never paste tokens into messages, tickets, or committed files.
+A successful initialization is not a published post. The bot polls the saved `publish_id`.
+Private results and completion without evidence of public visibility remain `needs_action`.
+A lost initialization response may already have started publication; it becomes `unknown`,
+with no automatic retry or inbox fallback. `/retry` rechecks only existing recoverable IDs.
+Inspect TikTok before deliberately sending the video as another job.
 
-YouTube now uses the native Google OAuth credential file named in `.env`. Upload-Post is
-retained only to reconcile historical requests; it is not a fallback upload provider.
+## References
 
-## Actual draft behavior
-
-Sending a valid captioned video requests native inbox upload with `FILE_UPLOAD`. The bot
-checks the existing publish ID after any uncertain transfer. Once TikTok reports inbox
-delivery, Telegram reports `needs_action` and returns the original caption separately.
-Open the TikTok inbox notification, paste/edit the caption, set content disclosures and
-visibility, and publish. The video draft endpoint accepts no caption, visibility, or
-commercial-disclosure fields. Polling ends at inbox delivery; the bot does not claim that
-your later manual action has occurred.
-
-Do not blindly resend an uncertain upload. `/retry` checks an existing publish ID. If the
-initialization response was lost before an ID could be saved, no video bytes were sent;
-the attempt is kept uncertain because there is no documented client-ID lookup endpoint.
-
-## Validation and design notes
-
-Local tests exercise chunk boundaries, callback state checks, private credential-file writes,
-draft/public status distinctions, SQLite migration, and recovery between destinations.
-They do not simulate a successful TikTok backend. Real authorization and a user-selected
-video are still required for end-to-end validation.
-
-**Learning Notes:** TikTok inbox initialization and media transfer are separate operations.
-Saving the server ID before media transfer permits safe status checks after a restart.
-
-**Why This Matters:** Draft delivery needs a human publishing step. Keeping it distinct from
-public success avoids misleading Telegram notifications and accidental duplicate uploads.
+- [Direct Post API](https://developers.tiktok.com/docs/en/content-posting-api-reference-direct-post)
+- [Creator information](https://developers.tiktok.com/docs/en/content-posting-api-reference-query-creator-info)
+- [Media transfer and URL verification](https://developers.tiktok.com/docs/en/content-posting-api-media-transfer-guide)
+- [Post status](https://developers.tiktok.com/docs/en/content-posting-api-reference-get-video-status)
+- [Desktop OAuth](https://developers.tiktok.com/docs/en/login-kit-desktop)

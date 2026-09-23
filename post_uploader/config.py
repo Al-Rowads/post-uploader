@@ -70,6 +70,14 @@ class Config:
     tiktok_credentials_file: Path = Path("/data/tiktok-credentials.json")
     youtube_credentials_file: Path = Path("/data/youtube-credentials.json")
     youtube_privacy: str = "private"
+    openrouter_key: str = field(default="", repr=False)
+    openrouter_model: str = "google/gemini-2.5-flash-lite"
+    telegram_channel_id: str = ""
+    public_site_url: str = ""
+    tiktok_direct_mode: str = "disabled"
+    tiktok_media_verified: bool = False
+    web_bind: str = "127.0.0.1"
+    web_port: int = 8080
 
     @classmethod
     def from_environment(cls) -> "Config":
@@ -86,16 +94,44 @@ class Config:
         if parsed.hostname == "api.telegram.org":
             raise ConfigurationError("Use the local Bot API server for large-file downloads.")
         declarations = {
-            "selfDeclaredMadeForKids": boolean("YOUTUBE_MADE_FOR_KIDS"),
-            "containsSyntheticMedia": boolean("YOUTUBE_CONTAINS_SYNTHETIC_MEDIA"),
-            "hasPaidProductPlacement": boolean("YOUTUBE_PAID_PRODUCT_PLACEMENT"),
+            field: boolean(name)
+            for field, name in (
+                ("selfDeclaredMadeForKids", "YOUTUBE_MADE_FOR_KIDS"),
+                ("containsSyntheticMedia", "YOUTUBE_CONTAINS_SYNTHETIC_MEDIA"),
+                ("hasPaidProductPlacement", "YOUTUBE_PAID_PRODUCT_PLACEMENT"),
+            )
+            if os.environ.get(name, "").strip()
         }
         maximum = positive_integer("MAX_VIDEO_BYTES", cls.max_video_bytes)
-        privacy = required("YOUTUBE_PRIVACY_STATUS")
+        privacy = os.environ.get("YOUTUBE_PRIVACY_STATUS", "private")
         if privacy not in {"private", "unlisted", "public"}:
             raise ConfigurationError("YOUTUBE_PRIVACY_STATUS must be private, unlisted, or public.")
         if maximum > cls.max_video_bytes:
             raise ConfigurationError("MAX_VIDEO_BYTES must not exceed 2000000000 in this version.")
+        direct_mode = os.environ.get("TIKTOK_DIRECT_MODE", "disabled")
+        if direct_mode not in {"disabled", "private_test", "approved"}:
+            raise ConfigurationError(
+                "TIKTOK_DIRECT_MODE must be disabled, private_test, or approved."
+            )
+        site = os.environ.get("PUBLIC_SITE_URL", "").rstrip("/")
+        if site:
+            parsed_site = urlsplit(site)
+            if (
+                parsed_site.scheme != "https"
+                or not parsed_site.hostname
+                or parsed_site.username
+                or parsed_site.password
+                or parsed_site.path
+                or parsed_site.query
+                or parsed_site.fragment
+            ):
+                raise ConfigurationError("PUBLIC_SITE_URL must be an HTTPS origin without a path.")
+        channel = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
+        if channel and not re.fullmatch(r"(?:-100[0-9]+|@[A-Za-z][A-Za-z0-9_]{4,})", channel):
+            raise ConfigurationError("TELEGRAM_CHANNEL_ID must be @channel or a -100… channel ID.")
+        web_port = positive_integer("WEB_PORT", cls.web_port)
+        if web_port > 65535:
+            raise ConfigurationError("WEB_PORT must be at most 65535.")
         return cls(
             telegram_token=token,
             owner_id=owner,
@@ -111,13 +147,29 @@ class Config:
                 "MEDIA_RETENTION_HOURS", cls.media_retention_hours
             ),
             max_pending_jobs=positive_integer("MAX_PENDING_JOBS", cls.max_pending_jobs),
-            tiktok_credentials_file=Path(required("TIKTOK_CREDENTIALS_FILE")),
-            youtube_credentials_file=Path(required("YOUTUBE_CREDENTIALS_FILE")),
+            tiktok_credentials_file=Path(
+                os.environ.get("TIKTOK_CREDENTIALS_FILE", str(cls.tiktok_credentials_file))
+            ),
+            youtube_credentials_file=Path(
+                os.environ.get("YOUTUBE_CREDENTIALS_FILE", str(cls.youtube_credentials_file))
+            ),
             youtube_privacy=privacy,
+            openrouter_key=required("OPENROUTER_API_KEY"),
+            openrouter_model=os.environ.get("OPENROUTER_MODEL", cls.openrouter_model),
+            telegram_channel_id=channel,
+            public_site_url=site,
+            tiktok_direct_mode=direct_mode,
+            tiktok_media_verified=(
+                boolean("TIKTOK_MEDIA_VERIFIED")
+                if os.environ.get("TIKTOK_MEDIA_VERIFIED")
+                else False
+            ),
+            web_bind=os.environ.get("WEB_BIND", cls.web_bind),
+            web_port=web_port,
         )
 
     def redact(self, message: str, limit: int = 700) -> str:
-        for secret in (self.telegram_token, self.upload_post_key):
+        for secret in (self.telegram_token, self.upload_post_key, self.openrouter_key):
             if secret:
                 message = message.replace(secret, "[redacted]")
         message = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]+", "[redacted]", message)

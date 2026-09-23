@@ -2,7 +2,8 @@
 
 Deploy the **contents of `website/dist/`** as the document root for
 `https://upload.al-rowads.com`. This is a static website with no build, package installation,
-JavaScript, cookies, analytics, sign-in form, or upload endpoint. The bot runs separately.
+JavaScript, cookies, or analytics on the public information pages. The optional TikTok
+Mini App is served separately by the bot under `/publisher/`, through the same HTTPS origin.
 
 | Page | URL to enter in developer consoles |
 | --- | --- |
@@ -33,8 +34,9 @@ website is not an OAuth token callback service. Do not submit brand verification
 pages are live and the app’s displayed branding matches them.
 
 TikTok sandbox URLs are already saved with these values. The desktop callback remains
-`http://127.0.0.1:8765/callback/`, not the public website. `FILE_UPLOAD` does not use this domain
-as a media download source. Any additional platform ownership or review requests remain separate.
+`http://127.0.0.1:8765/callback/`, not the public website. The new Direct Post integration uses
+verified HTTPS media URLs under `/publisher/media/`; complete domain or URL-prefix verification
+before enabling it. See [TikTok setup](../docs/tiktok-setup.md).
 
 The pages identify the operator as Level13 Publisher and use the existing account contact
 `level13.alrowads@gmail.com`. The privacy policy describes the current code: no platform
@@ -46,3 +48,8 @@ local records and backups as appropriate. The website does not implement automat
 and [Google brand verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/brand-verification)
 were used to check the required links and disclosure topics. These pages do not themselves
 establish approval or domain verification.
+
+The updated privacy and overview pages describe OpenRouter caption processing, per-platform
+approval, channel publishing, and the optional TikTok Mini App. Deploy those pages together
+with the new bot release. The Mini App uses the official Telegram JavaScript bridge and sends
+signed initialization data to the bot backend; it is not served by the static-file preview command.

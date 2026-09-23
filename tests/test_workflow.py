@@ -102,7 +102,7 @@ class DatabaseTests(unittest.TestCase):
         self.directory.cleanup()
 
     def create(self):
-        return self.db.create_job(self.message, self.media, {})
+        return self.db.create_job(self.message, self.media, {}, ["youtube", "tiktok"])
 
     def test_duplicate_telegram_delivery_creates_one_job(self):
         first = self.create()
@@ -118,18 +118,29 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.get_setting("offset"), "0")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
 
-    def test_missing_caption_waits_for_reply(self):
-        self.message.pop("caption")
+    def approve(self, job_id):
+        self.db.execute(
+            "UPDATE jobs SET state='queued',title='A walk by the river' WHERE id=?", (job_id,)
+        )
+        self.db.execute(
+            "UPDATE destinations SET state='ready',approved=1,caption='River walk' WHERE job_id=?",
+            (job_id,),
+        )
+
+    def test_every_upload_waits_for_title_and_approval(self):
         job_id = self.create()
-        self.assertEqual(self.db.job(job_id)["state"], "waiting_caption")
-        self.db.caption(job_id, "River walk")
-        self.assertEqual(self.db.job(job_id)["state"], "queued")
+        self.assertEqual(self.db.job(job_id)["state"], "waiting_title")
+        with self.assertRaises(ValueError):
+            self.db.prepare_attempt(job_id, ["youtube"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
 
     def test_restart_recovers_preparation_but_does_not_resubmit_attempt(self):
         job_id = self.create()
+        self.approve(job_id)
         self.db.execute("UPDATE jobs SET state='preparing' WHERE id=?", (job_id,))
         self.db.recover()
         self.assertEqual(self.db.job(job_id)["state"], "queued")
+        self.approve(job_id)
         request_id = self.db.prepare_attempt(job_id, ["youtube", "tiktok"])
         self.db.connection.close()
         self.db = Database(self.path)
@@ -147,10 +158,11 @@ class DatabaseTests(unittest.TestCase):
         self.db.finish_if_terminal(job_id)
         self.db.retry(job_id)
         states = {row["platform"]: row["state"] for row in self.db.destinations(job_id)}
-        self.assertEqual(states, {"youtube": "published", "tiktok": "ready"})
+        self.assertEqual(states, {"youtube": "published", "tiktok": "review"})
 
     def test_unknown_attempt_retry_only_rechecks_existing_request(self):
         job_id = self.create()
+        self.approve(job_id)
         request_id = self.db.prepare_attempt(job_id, ["youtube", "tiktok"])
         self.db.execute("UPDATE attempts SET state='unknown'")
         self.db.retry(job_id)
@@ -162,9 +174,9 @@ class DatabaseTests(unittest.TestCase):
 
     def test_cannot_cancel_or_change_caption_after_submission(self):
         job_id = self.create()
+        self.approve(job_id)
         self.db.prepare_attempt(job_id, ["youtube", "tiktok"])
         self.db.cancel(job_id)
-        self.db.caption(job_id, "Changed title")
         self.assertEqual(self.db.job(job_id)["state"], "submitted")
         self.assertEqual(self.db.job(job_id)["title"], "A walk by the river")
 
@@ -179,11 +191,16 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             owner_id=1,
             upload_post_key="",
             profile="",
-            declarations={},
+            declarations={
+                "selfDeclaredMadeForKids": False,
+                "containsSyntheticMedia": False,
+                "hasPaidProductPlacement": False,
+            },
             data_directory=self.root,
             telegram_files=self.root,
         )
         self.service = Service(self.config, self.db)
+        self.db.set_setting("active_platforms", '["youtube","tiktok"]')
 
     async def asyncTearDown(self):
         await self.service.close()
@@ -218,71 +235,55 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.command(1, "/resume")
         self.assertEqual(self.db.get_setting("paused"), "false")
 
-    async def test_ineligible_short_skips_youtube_and_continues_tiktok(self):
+    def reviewed(self):
         self.service.handle_update(self.update())
+        self.db.execute("UPDATE jobs SET state='queued',title='River walk'")
+        self.db.execute("UPDATE destinations SET state='ready',approved=1,caption='River walk'")
+
+    async def test_ineligible_short_skips_youtube_and_continues_telegram(self):
+        self.db.set_setting("active_platforms", '["youtube","telegram"]')
+        self.db.set_setting("telegram_channel", '{"chat_id":-100123}')
+        self.reviewed()
         path = self.root / "bot" / "videos" / "video.mp4"
-        self.db.execute("UPDATE jobs SET local_path=? WHERE id=1", (str(path),))
         video = Video(100, 30, 1920, 1080, 30, "h264", "mov,mp4")
-
-        async def record_tiktok_attempt(*args):
-            self.db.prepare_attempt(1, ["tiktok"], provider="tiktok")
-
         with (
-            patch("post_uploader.service.safe_media_path", return_value=path),
-            patch("post_uploader.service.inspect_video", AsyncMock(return_value=video)),
-            patch.object(self.service.youtube, "credentials", AsyncMock()) as youtube_auth,
-            patch.object(self.service.youtube, "initialize", AsyncMock()) as youtube_upload,
-            patch.object(self.service.tiktok, "credentials", AsyncMock()),
             patch.object(
-                self.service, "submit_tiktok", AsyncMock(side_effect=record_tiktok_attempt)
-            ) as tiktok_upload,
+                self.service.review, "ensure_media", AsyncMock(return_value=(path, video))
+            ),
+            patch.object(self.service.youtube, "initialize", AsyncMock()) as youtube_upload,
+            patch.object(self.service.telegram, "channel", AsyncMock()),
+            patch.object(self.service, "submit_telegram", AsyncMock()) as telegram_upload,
         ):
             await self.service.prepare(self.db.job(1))
-            youtube_auth.assert_not_awaited()
             youtube_upload.assert_not_awaited()
-            tiktok_upload.assert_awaited_once()
-        destinations = {row["platform"]: row for row in self.db.destinations(1)}
-        self.assertEqual(destinations["youtube"]["state"], "invalid")
-        self.assertIn("16:9", destinations["youtube"]["message"])
-        self.assertEqual(destinations["tiktok"]["state"], "pending")
-        self.assertEqual(
-            self.db.execute("SELECT COUNT(*) FROM attempts WHERE provider='youtube'").fetchone()[0],
-            0,
-        )
-        self.db.outcome(1, "tiktok", Outcome("needs_action"))
-        self.db.finish_if_terminal(1)
-        self.assertIn("Invalid media needs a new video", self.db.retry(1))
-        states = {row["platform"]: row["state"] for row in self.db.destinations(1)}
-        self.assertEqual(states["youtube"], "invalid")
+            telegram_upload.assert_awaited_once()
+        self.assertEqual(self.db.destination(1, "youtube")["state"], "invalid")
+        self.assertIn("16:9", self.db.destination(1, "youtube")["message"])
 
     async def test_eligible_short_uses_existing_youtube_submission(self):
-        self.service.handle_update(self.update())
+        self.db.set_setting("active_platforms", '["youtube"]')
+        self.reviewed()
         path = self.root / "bot" / "videos" / "video.mp4"
-        self.db.execute("UPDATE jobs SET local_path=? WHERE id=1", (str(path),))
-        self.db.outcome(1, "tiktok", Outcome("needs_action"))
         video = Video(100, 180, 1080, 1920, 30, "h264", "mov,mp4")
 
-        async def record_youtube_attempt(*args):
-            self.db.prepare_attempt(1, ["youtube"], provider="youtube")
+        async def record_attempt(*args):
+            self.db.prepare_attempt(1, ["youtube"], "youtube")
 
         with (
-            patch("post_uploader.service.safe_media_path", return_value=path),
-            patch("post_uploader.service.inspect_video", AsyncMock(return_value=video)),
-            patch.object(self.service.youtube, "credentials", AsyncMock()) as youtube_auth,
             patch.object(
-                self.service, "submit_youtube", AsyncMock(side_effect=record_youtube_attempt)
-            ) as youtube_upload,
+                self.service.review, "ensure_media", AsyncMock(return_value=(path, video))
+            ),
+            patch.object(self.service.youtube, "credentials", AsyncMock()),
+            patch.object(
+                self.service, "submit_youtube", AsyncMock(side_effect=record_attempt)
+            ) as upload,
         ):
             await self.service.prepare(self.db.job(1))
-            youtube_auth.assert_awaited_once()
-            youtube_upload.assert_awaited_once()
-            job, submitted_path = youtube_upload.await_args.args
-            self.assertEqual(job["caption"], "River walk")
+            upload.assert_awaited_once()
+            publication, submitted_path = upload.await_args.args
+            self.assertEqual(publication["caption"], "River walk")
             self.assertEqual(submitted_path, path)
-        self.assertEqual(
-            self.db.execute("SELECT COUNT(*) FROM attempts WHERE provider='youtube'").fetchone()[0],
-            1,
-        )
+        self.assertEqual(self.db.destination(1, "youtube")["state"], "pending")
 
     async def test_explicit_failed_result_does_not_erase_prior_success(self):
         self.service.handle_update(self.update())
@@ -299,19 +300,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(states, {"youtube": "published", "tiktok": "failed"})
 
     async def test_cleanup_only_removes_tracked_inactive_media(self):
-        self.service.handle_update(self.update())
+        self.reviewed()
         folder = self.root / "bot" / "videos"
         folder.mkdir(parents=True)
         media = folder / "video.mp4"
         media.write_bytes(b"")
         self.db.execute(
-            "UPDATE jobs SET local_path=?,media_saved_at=? WHERE id=1",
+            "UPDATE media_assets SET local_path=?,saved_at=? WHERE id=1",
             (str(media), time.time() - 73 * 3600),
         )
         request_id = self.db.prepare_attempt(1, ["youtube", "tiktok"])
         self.service.cleanup()
         self.assertTrue(media.exists())
         self.db.execute("UPDATE attempts SET state='unknown' WHERE request_id=?", (request_id,))
+        self.service.cleanup()
+        self.assertTrue(media.exists())
+        self.db.execute("UPDATE attempts SET state='done'")
+        self.db.execute("UPDATE destinations SET state='failed'")
+        self.db.execute("UPDATE jobs SET state='settled'")
         self.service.cleanup()
         self.assertFalse(media.exists())
         self.assertTrue((self.root / "jobs.sqlite3").exists())

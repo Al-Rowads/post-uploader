@@ -90,6 +90,8 @@ class YouTubeProtocolTests(unittest.TestCase):
                 {"file_id": "", "file_unique_id": "", "file_size": 1},
                 {},
             )
+            db.execute("UPDATE jobs SET state='queued',title='Resume test'")
+            db.execute("UPDATE destinations SET state='ready',approved=1,caption='Resume test'")
             request = db.prepare_attempt(job, ["youtube"], "youtube")
             uri = "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=protocol-test"
             db.execute("UPDATE attempts SET session_uri=? WHERE request_id=?", (uri, request))
@@ -101,7 +103,7 @@ class YouTubeProtocolTests(unittest.TestCase):
                 self.assertEqual(row["session_uri"], uri)
                 self.assertEqual(row["provider"], "youtube")
                 states = {r["platform"]: r["state"] for r in db.destinations(job)}
-                self.assertEqual(states, {"youtube": "pending", "tiktok": "ready"})
+                self.assertEqual(states, {"youtube": "pending"})
             finally:
                 db.connection.close()
 

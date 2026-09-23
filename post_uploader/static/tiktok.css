@@ -1,0 +1,12 @@
+:root {color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif;}
+body {margin: 0; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #161616);}
+main {max-width: 36rem; margin: auto; padding: 1.25rem;}
+h1 {font-size: 1.6rem;} h2 {font-size: 1.1rem;}
+video {width: 100%; max-height: 24rem; border-radius: .7rem; background: #111;}
+label {display: block; margin: .7rem 0;}
+textarea, select {box-sizing: border-box; width: 100%; padding: .75rem; font: inherit; border-radius: .5rem;}
+fieldset {margin: 1rem 0; border: 1px solid #888; border-radius: .5rem;}
+input[type=checkbox] {width: 1.2rem; height: 1.2rem; vertical-align: middle;}
+button {width: 100%; padding: .9rem; border: 0; border-radius: .5rem; font: inherit; background: #1675ba; color: white;}
+button:disabled {opacity: .45;} a {color: #1675ba;} [hidden] {display: none;}
+#status, #validation {overflow-wrap: anywhere;} #validation {color: #bb2929;}

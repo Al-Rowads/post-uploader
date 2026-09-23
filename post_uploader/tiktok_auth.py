@@ -20,13 +20,13 @@ REDIRECT_URI = "http://127.0.0.1:8765/callback/"
 SCOPES = "user.info.basic,video.upload"
 
 
-def authorization_url(client_key: str, state: str, verifier: str) -> str:
+def authorization_url(client_key: str, state: str, verifier: str, mode="draft") -> str:
     # TikTok's desktop guide explicitly requires hex SHA-256, unlike base64url PKCE.
     return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(
         {
             "client_key": client_key,
             "response_type": "code",
-            "scope": SCOPES,
+            "scope": SCOPES if mode == "draft" else "user.info.basic,video.upload,video.publish",
             "redirect_uri": REDIRECT_URI,
             "state": state,
             "code_challenge": hashlib.sha256(verifier.encode()).hexdigest(),
@@ -53,7 +53,7 @@ def callback_code(target: str, expected_state: str) -> str:
     return codes[0]
 
 
-def authorize(path: Path):
+def authorize(path: Path, mode="direct"):
     credentials = read_credentials(path)
     if not all(credentials.get(key) for key in ("client_key", "client_secret")):
         raise RemoteError(
@@ -86,7 +86,7 @@ def authorize(path: Path):
     with HTTPServer(("127.0.0.1", 8765), Callback) as server:
         server.timeout = 1
         print("Open this URL in Safari and authorize the intended TikTok account:", flush=True)
-        print(authorization_url(credentials["client_key"], state, verifier), flush=True)
+        print(authorization_url(credentials["client_key"], state, verifier, mode), flush=True)
         deadline = time.monotonic() + 600
         while "code" not in received and time.monotonic() < deadline:
             server.handle_request()
@@ -104,25 +104,34 @@ def authorize(path: Path):
                 "code_verifier": verifier,
             },
         )
-    save_credentials(path, token_response(response, credentials))
+    save_credentials(
+        path,
+        token_response(
+            response, credentials, "video.publish" if mode == "direct" else "video.upload"
+        ),
+    )
     print("TikTok upload authorization saved. No video was uploaded.")
 
 
-async def check(path: Path):
+async def check(path: Path, mode="direct"):
     tiktok = TikTok(path)
     try:
+        await tiktok.credentials("video.publish" if mode == "direct" else "video.upload")
+        if mode == "direct":
+            await tiktok.creator_info()
         account = await tiktok.account()
         print(f"TikTok: {account.get('display_name', account['open_id'])}")
-        print("video.upload token and account verified. No video was uploaded.")
-        print("App review and real draft delivery are separate checks.")
+        print(f"TikTok {mode} token and account verified. No video was uploaded.")
+        print("App review and live publication or draft delivery are separate checks.")
     finally:
         await tiktok.client.aclose()
 
 
 def main():
     load_local_environment()
-    parser = argparse.ArgumentParser(description="Authorize native TikTok draft uploads")
+    parser = argparse.ArgumentParser(description="Authorize native TikTok posting")
     parser.add_argument("command", choices=("authorize", "check"))
+    parser.add_argument("--mode", choices=("direct", "draft"), default="direct")
     parser.add_argument(
         "--credentials",
         type=Path,
@@ -134,9 +143,9 @@ def main():
     logging.getLogger("httpcore").setLevel(logging.CRITICAL)
     try:
         if arguments.command == "authorize":
-            authorize(arguments.credentials)
+            authorize(arguments.credentials, arguments.mode)
         else:
-            asyncio.run(check(arguments.credentials))
+            asyncio.run(check(arguments.credentials, arguments.mode))
     except RemoteError as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
