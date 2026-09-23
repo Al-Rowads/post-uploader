@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 
 from .clients import Publisher, RemoteError, Telegram
-from .config import Config
+from .config import Config, owner_matches
 from .database import Database
 from .domain import TERMINAL_DESTINATIONS, Outcome, outcome_from_result, result_list
 from .media import MediaError, safe_media_path
@@ -58,13 +58,19 @@ class Service:
         await self.tiktok.client.aclose()
         await self.youtube.client.aclose()
 
+    def is_owner_chat(self, user, chat):
+        return (
+            owner_matches(user, self.config.owner_username)
+            and isinstance(chat, dict)
+            and chat.get("type") == "private"
+            and chat.get("id") == user["id"]
+        )
+
     def handle_update(self, update: dict):
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
             return
-        if message.get("from", {}).get("id") != self.config.owner_id:
-            return
-        if message.get("chat", {}).get("type") != "private":
+        if not self.is_owner_chat(message.get("from"), message.get("chat")):
             return
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
@@ -90,7 +96,9 @@ class Service:
                 else "Approved publications resumed.",
             )
         elif command == "/status" and len(arguments) == 1:
-            jobs = self.db.execute("SELECT id FROM jobs ORDER BY id DESC LIMIT 10").fetchall()
+            jobs = self.db.execute(
+                "SELECT id FROM jobs WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,)
+            ).fetchall()
             body = "Uploads paused.\n" if self.db.get_setting("paused") == "true" else ""
             body += "\n\n".join(self.db.summarize(job[0]) for job in jobs) or "No jobs yet."
             self.db.notify(chat_id, body)
@@ -718,15 +726,8 @@ class Service:
         if self.config.tiktok_direct_mode != "disabled":
             await self.web.start()
         await self.telegram.call("deleteWebhook", drop_pending_updates=False)
-        self.db.notify(
-            self.config.owner_id,
-            "Bot started. "
-            + (
-                "Uploads remain paused."
-                if self.db.get_setting("paused") == "true"
-                else "Send a video to start a review, or use /platforms."
-            ),
-        )
+        # Private users cannot be messaged by username; replies use incoming chat IDs.
+        logger.info("Bot started. Send /start in the owner's private chat.")
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(self.ingest())
             tasks.create_task(self.worker())

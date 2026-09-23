@@ -100,6 +100,29 @@ def healthcheck():
         return 1
 
 
+def bind_database_identity(config: Config, database: Database):
+    identity = {
+        "bot": config.telegram_token.split(":")[0],
+        "owner": config.owner_username.removeprefix("@").casefold(),
+        "profile": config.profile,
+    }
+    saved = database.get_setting("identity")
+    if saved:
+        try:
+            saved = json.loads(saved)
+        except ValueError as error:
+            raise ConfigurationError("The saved database identity is invalid.") from error
+        if isinstance(saved, dict) and type(saved.get("owner")) is int and saved["owner"] > 0:
+            # Upgrade the old numeric setting; jobs retain their original chat ownership.
+            saved["owner"] = identity["owner"]
+        if saved != identity:
+            raise ConfigurationError(
+                "This database belongs to a different bot, owner username, or Upload-Post profile. "
+                "Restore the original configuration or use a separate data directory."
+            )
+    database.set_setting("identity", json.dumps(identity, sort_keys=True))
+
+
 async def run_service(config: Config):
     config.data_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (config.data_directory / "service.lock").open("a") as lock:
@@ -108,22 +131,11 @@ async def run_service(config: Config):
         except BlockingIOError:
             raise ConfigurationError("Another bot instance is using this data directory.") from None
         database = Database(config.data_directory / "jobs.sqlite3")
-        identity = json.dumps(
-            {
-                "bot": config.telegram_token.split(":")[0],
-                "owner": config.owner_id,
-                "profile": config.profile,
-            },
-            sort_keys=True,
-        )
-        saved_identity = database.get_setting("identity")
-        if saved_identity and saved_identity != identity:
+        try:
+            bind_database_identity(config, database)
+        except ConfigurationError:
             database.connection.close()
-            raise ConfigurationError(
-                "This database belongs to a different bot, owner, or Upload-Post profile. "
-                "Restore the original configuration or use a separate data directory."
-            )
-        database.set_setting("identity", identity)
+            raise
         service = Service(config, database)
         task = asyncio.create_task(service.run())
         loop = asyncio.get_running_loop()

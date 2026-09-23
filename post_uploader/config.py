@@ -10,6 +10,17 @@ class ConfigurationError(ValueError):
     pass
 
 
+def owner_matches(user: object, username: str) -> bool:
+    return (
+        isinstance(user, dict)
+        and type(user.get("id")) is int
+        and user["id"] > 0
+        and user.get("is_bot") is not True
+        and isinstance(user.get("username"), str)
+        and user["username"].casefold() == username.removeprefix("@").casefold()
+    )
+
+
 def load_local_environment(path: Path = Path(".env")):
     """Read literal KEY=value settings without evaluating shell commands or expansions."""
     if not path.is_file():
@@ -56,7 +67,7 @@ def positive_integer(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Config:
     telegram_token: str = field(repr=False)
-    owner_id: int
+    owner_username: str
     upload_post_key: str = field(repr=False)
     profile: str
     declarations: dict[str, bool]
@@ -84,7 +95,9 @@ class Config:
         token = required("TELEGRAM_BOT_TOKEN")
         if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
             raise ConfigurationError("TELEGRAM_BOT_TOKEN is not a BotFather token.")
-        owner = positive_integer("TELEGRAM_ALLOWED_USER_ID", 0)
+        owner = required("TELEGRAM_ALLOWED_USERNAME").removeprefix("@").casefold()
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", owner):
+            raise ConfigurationError("TELEGRAM_ALLOWED_USERNAME must be a username like @NotRshia.")
         endpoint = os.environ.get("TELEGRAM_API_URL", cls.telegram_url).rstrip("/")
         parsed = urlsplit(endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
@@ -134,7 +147,7 @@ class Config:
             raise ConfigurationError("WEB_PORT must be at most 65535.")
         return cls(
             telegram_token=token,
-            owner_id=owner,
+            owner_username=owner,
             upload_post_key=os.environ.get("UPLOAD_POST_API_KEY", ""),
             profile=os.environ.get("UPLOAD_POST_PROFILE", ""),
             declarations=declarations,

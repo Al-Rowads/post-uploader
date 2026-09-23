@@ -61,7 +61,7 @@ owner-only permissions. Start from `.env.example` for a new installation.
 
 | Setting | Purpose |
 | --- | --- |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID` | BotFather token and sole allowed owner's numeric ID |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERNAME` | BotFather token and sole allowed owner's username, e.g. `@NotRshia` (case-insensitive, `@` optional) |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Local Telegram Bot API application credentials |
 | `OPENROUTER_API_KEY` | Required OpenRouter key with credit for caption generation |
 | `OPENROUTER_MODEL` | Defaults to `google/gemini-2.5-flash-lite`; replacement models must support structured outputs |
@@ -79,6 +79,18 @@ Enable Telegram through `/platforms` after adding the bot as a channel administr
 bot resolves and saves the channel's numeric identity. To change the channel for future jobs,
 change the environment setting, restart, then disable/re-enable Telegram in `/platforms`.
 Existing jobs retain their original target.
+
+Owner access uses the sender's Telegram username for messages, buttons, and the signed TikTok
+form. Replace `TELEGRAM_ALLOWED_USER_ID` with `TELEGRAM_ALLOWED_USERNAME=@NotRshia` in `.env`;
+the old numeric setting is ignored. Rebuild and recreate the bot container, then send `/start`
+from that account. The bot gets reply chat IDs from incoming messages, so no ID lookup is needed.
+Startup is logged in the container instead of sending an unsolicited private message.
+
+**Learning Notes:** Username access follows the username Telegram supplies, not a configured
+numeric account ID. Existing job ownership still uses the original private chat.
+
+**Why This Matters:** Case differences do not block the owner, missing or different usernames
+are denied, and a matching username cannot open jobs belonging to another chat.
 
 OpenRouter receives only the title, master caption, and platform instructions; it does not
 receive video bytes or account credentials. One structured request generates all active

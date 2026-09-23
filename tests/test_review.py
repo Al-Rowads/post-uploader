@@ -55,9 +55,9 @@ def form_values(**overrides):
     }
 
 
-def signed_init_data(token, user=1, timestamp=None):
+def signed_init_data(token, user=1, timestamp=None, username="NotRshia"):
     fields = {
-        "user": json.dumps({"id": user}),
+        "user": json.dumps({"id": user, "username": username}),
         "auth_date": str(int(time.time()) if timestamp is None else timestamp),
     }
     secret = hmac.digest(b"WebAppData", token.encode(), "sha256")
@@ -75,7 +75,7 @@ class ReviewFixture(unittest.IsolatedAsyncioTestCase):
         self.db = Database(self.db_path)
         self.config = Config(
             telegram_token="1:test-token",
-            owner_id=1,
+            owner_username="notrshia",
             upload_post_key="",
             profile="",
             declarations=DECLARATIONS,
@@ -126,7 +126,12 @@ class ReviewFixture(unittest.IsolatedAsyncioTestCase):
         self.directory.cleanup()
 
     def incoming(self, **fields):
-        return {"from": {"id": 1}, "chat": {"id": 1, "type": "private"}, "message_id": 10, **fields}
+        return {
+            "from": {"id": 1, "username": "NotRshia"},
+            "chat": {"id": 1, "type": "private"},
+            "message_id": 10,
+            **fields,
+        }
 
     def upload(self, message_id=10, *, document=False):
         media = {
@@ -192,13 +197,13 @@ class ReviewFixture(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         return job_id
 
-    async def click(self, job_id, platform, action, *, revision=None, user=1):
+    async def click(self, job_id, platform, action, *, revision=None, user=1, username="NotRshia"):
         destination = self.db.destination(job_id, platform)
         revision = destination["revision"] if revision is None else revision
         await self.service.review.callback(
             {
                 "id": "callback-test",
-                "from": {"id": user},
+                "from": {"id": user, "username": username},
                 "message": {
                     "chat": {"id": 1, "type": "private"},
                     "message_id": destination["preview_message_id"],
@@ -209,6 +214,39 @@ class ReviewFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class ReviewTests(ReviewFixture):
+    async def test_username_owner_does_not_need_a_preconfigured_chat_id(self):
+        self.service.handle_update(
+            {
+                "message": self.incoming(
+                    **{
+                        "from": {"id": 42, "username": "NOTRSHIA"},
+                        "chat": {"id": 42, "type": "private"},
+                        "text": "/start",
+                    }
+                )
+            }
+        )
+        await self.drain()
+        method, values = self.sent[-1]
+        self.assertEqual(method, "sendMessage")
+        self.assertEqual(values["chat_id"], 42)
+
+    async def test_changed_or_missing_sender_username_cannot_approve_review(self):
+        job_id = await self.ready_for_review()
+        for username in ("someone_else", None, ""):
+            await self.click(job_id, "youtube", "accept", username=username)
+            self.assertEqual(self.db.destination(job_id, "youtube")["state"], "review")
+        await self.click(job_id, "youtube", "accept", username="NOTRSHIA")
+        self.assertEqual(self.db.destination(job_id, "youtube")["state"], "ready")
+
+    async def test_status_only_lists_jobs_for_the_senders_chat(self):
+        self.upload()
+        self.service.command(42, "/status")
+        self.assertEqual(
+            self.db.execute("SELECT body FROM outbox ORDER BY id DESC LIMIT 1").fetchone()[0],
+            "No jobs yet.",
+        )
+
     async def test_three_independent_previews_and_explicit_intake(self):
         job_id = await self.ready_for_review()
         previews = [parameters for method, parameters in self.sent if method == "sendVideo"]
@@ -340,7 +378,7 @@ class ReviewTests(ReviewFixture):
         menu = self.db.execute("SELECT * FROM outbox WHERE kind='menu'").fetchone()
         callback = {
             "id": "toggle",
-            "from": {"id": 1},
+            "from": {"id": 1, "username": "NotRshia"},
             "data": "platform:tiktok:0",
             "message": {
                 "chat": {"id": 1, "type": "private"},
@@ -555,7 +593,7 @@ class ReviewTests(ReviewFixture):
 
 class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.config = Config("1:token", 1, "", "", {}, openrouter_key="test-key")
+        self.config = Config("1:token", "notrshia", "", "", {}, openrouter_key="test-key")
         self.router = OpenRouter(self.config)
         self.requests = []
 
@@ -648,15 +686,16 @@ class TikTokFormTests(unittest.TestCase):
 
     def test_init_data_requires_signature_owner_freshness_and_unique_fields(self):
         raw = signed_init_data("token", timestamp=1000)
-        self.assertEqual(validate_init_data(raw, "token", 1, now=1001)["id"], 1)
+        self.assertEqual(validate_init_data(raw, "token", "notrshia", now=1001)["id"], 1)
         for value in (
             raw,
             raw + "&user=2",
             raw.replace("1000", "1001"),
-            signed_init_data("token", user=2, timestamp=1000),
+            signed_init_data("token", username="someone_else", timestamp=1000),
+            signed_init_data("token", username=None, timestamp=1000),
         ):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                validate_init_data(value, "token", 1, now=3000 if value == raw else 1001)
+                validate_init_data(value, "token", "notrshia", now=3000 if value == raw else 1001)
 
     def test_unicode_caption_budget_leaves_room_for_review_header(self):
         caption = "😀" * 400
@@ -709,6 +748,20 @@ class PublishingWebTests(ReviewFixture):
         self.assertEqual(destination["state"], "ready")
         self.assertEqual(destination["caption"], "Approved TikTok caption")
         self.assertEqual(self.db.destination(job_id, "youtube")["state"], "review")
+
+    async def test_signed_username_must_match_and_job_stays_bound_to_its_chat(self):
+        job_id = await self.ready_for_review()
+        url = f"/publisher/api/tiktok/{job_id}"
+        for user, username, status in ((1, "other", 401), (1, None, 401), (2, "NOTRSHIA", 404)):
+            headers = {
+                **self.headers,
+                "X-Telegram-Init-Data": signed_init_data(
+                    self.config.telegram_token, user=user, username=username
+                ),
+            }
+            response = await self.client.post(url, json=form_values(), headers=headers)
+            self.assertEqual(response.status, status)
+        self.assertEqual(self.db.destination(job_id, "tiktok")["state"], "review")
 
     async def test_media_capability_is_scoped_expires_and_supports_range(self):
         job_id = await self.ready_for_review()

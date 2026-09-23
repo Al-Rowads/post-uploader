@@ -235,11 +235,7 @@ class ReviewWorkflow:
 
     async def callback(self, callback):
         message = callback.get("message", {})
-        allowed = (
-            callback.get("from", {}).get("id") == self.config.owner_id
-            and message.get("chat", {}).get("type") == "private"
-            and message["chat"]["id"] == self.config.owner_id
-        )
+        allowed = self.service.is_owner_chat(callback.get("from"), message.get("chat"))
         try:
             await self.telegram.call(
                 "answerCallbackQuery",

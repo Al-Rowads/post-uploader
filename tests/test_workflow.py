@@ -26,7 +26,7 @@ class CaptionTests(unittest.TestCase):
     def test_redaction_preserves_long_bot_messages_without_exposing_credentials(self):
         config = Config(
             telegram_token="123456:secret",
-            owner_id=1,
+            owner_username="notrshia",
             upload_post_key="private-api-key",
             profile="",
             declarations={},
@@ -86,7 +86,7 @@ class DatabaseTests(unittest.TestCase):
         self.db = Database(self.path)
         self.message = {
             "chat": {"id": 1, "type": "private"},
-            "from": {"id": 1},
+            "from": {"id": 1, "username": "NotRshia"},
             "message_id": 1,
             "caption": "A walk by the river\n#nature",
         }
@@ -188,7 +188,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.db = Database(self.root / "jobs.sqlite3")
         self.config = Config(
             telegram_token="",
-            owner_id=1,
+            owner_username="notrshia",
             upload_post_key="",
             profile="",
             declarations={
@@ -211,7 +211,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         return {
             "update_id": 1,
             "message": {
-                "from": {"id": user},
+                "from": {"id": user, "username": "NotRshia" if user == 1 else "someone_else"},
                 "chat": {"id": user, "type": chat_type},
                 "message_id": 1,
                 "caption": "River walk",

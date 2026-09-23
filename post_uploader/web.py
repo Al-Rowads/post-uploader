@@ -10,11 +10,12 @@ import httpx
 from aiohttp import web
 
 from .clients import RemoteError
+from .config import owner_matches
 from .media import MediaError, safe_media_path
 from .tiktok import direct_post_info
 
 
-def validate_init_data(raw: str, bot_token: str, owner_id: int, now: float | None = None):
+def validate_init_data(raw: str, bot_token: str, owner_username: str, now: float | None = None):
     now = time.time() if now is None else now
     try:
         pairs = parse_qsl(raw, strict_parsing=True, keep_blank_values=True, max_num_fields=30)
@@ -32,7 +33,7 @@ def validate_init_data(raw: str, bot_token: str, owner_id: int, now: float | Non
             raise ValueError
         age = now - int(fields["auth_date"])
         user = json.loads(fields["user"])
-        if not 0 <= age <= 900 or type(user.get("id")) is not int or user["id"] != owner_id:
+        if not 0 <= age <= 900 or not owner_matches(user, owner_username):
             raise ValueError
         return user
     except (KeyError, ValueError, TypeError, AttributeError) as error:
@@ -75,10 +76,10 @@ class PublishingWeb:
 
     def authenticate(self, request):
         try:
-            validate_init_data(
+            user = validate_init_data(
                 request.headers.get("X-Telegram-Init-Data", ""),
                 self.config.telegram_token,
-                self.config.owner_id,
+                self.config.owner_username,
             )
         except ValueError as error:
             raise web.HTTPUnauthorized(text=str(error)) from error
@@ -87,14 +88,15 @@ class PublishingWeb:
             and request.headers.get("Origin") != self.config.public_site_url
         ):
             raise web.HTTPForbidden(text="Invalid form origin.")
+        return user
 
-    def destination(self, request, revision):
+    def destination(self, request, revision, user_id):
         job_id = int(request.match_info["job"])
         if not 0 < job_id < 2**63 or type(revision) is not int or not 0 <= revision < 2**63:
             raise web.HTTPNotFound()
         job = self.db.job(job_id)
         destination = self.db.destination(job_id, "tiktok")
-        if not job or job["chat_id"] != self.config.owner_id or not destination:
+        if not job or job["chat_id"] != user_id or not destination:
             raise web.HTTPNotFound()
         if destination["revision"] != revision or destination["state"] not in {
             "review",
@@ -139,16 +141,16 @@ class PublishingWeb:
         return f"{self.config.public_site_url}/publisher/media/{token}"
 
     async def context(self, request):
-        self.authenticate(request)
+        user = self.authenticate(request)
         revision = int(request.query.get("revision", "-1"))
-        destination = self.destination(request, revision)
+        destination = self.destination(request, revision, user["id"])
         self.service.review.check_direct_config()
         await self.service.review.check_tiktok_identity("video.publish")
         creator = await self.service.tiktok.creator_info()
         _, video = await self.service.review.ensure_media(destination["media_id"])
         if reason := video.tiktok_error(creator["max_video_post_duration_sec"]):
             raise MediaError(reason)
-        destination = self.destination(request, revision)
+        destination = self.destination(request, revision, user["id"])
         url = self.media_link(destination["job_id"], destination["media_id"], revision, "preview")
         return web.json_response(
             {
@@ -162,11 +164,11 @@ class PublishingWeb:
         )
 
     async def publish(self, request):
-        self.authenticate(request)
+        user = self.authenticate(request)
         values = await request.json()
         if not isinstance(values, dict):
             raise ValueError("Invalid publishing form.")
-        destination = self.destination(request, values.get("revision"))
+        destination = self.destination(request, values.get("revision"), user["id"])
         self.service.review.check_direct_config()
         await self.service.review.check_tiktok_identity("video.publish")
         creator = await self.service.tiktok.creator_info()
@@ -175,7 +177,7 @@ class PublishingWeb:
         if reason := video.tiktok_error(creator["max_video_post_duration_sec"]):
             raise MediaError(reason)
         with self.db.transaction():
-            destination = self.destination(request, values.get("revision"))
+            destination = self.destination(request, values.get("revision"), user["id"])
             self.db.execute(
                 "UPDATE destinations SET caption=?,settings=?,approved=1 WHERE job_id=? "
                 "AND platform='tiktok'",

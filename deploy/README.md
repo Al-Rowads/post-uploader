@@ -106,3 +106,14 @@ Read `/status` after restart to distinguish pending reviews, failed configuratio
 legacy uploads. The process health check does not prove Direct Post approval, OpenRouter
 credit, channel posting access, or successful delivery. Live publication validation requires
 an explicitly selected real video and account/channel access.
+
+Owner access now uses `TELEGRAM_ALLOWED_USERNAME`, for example `@NotRshia`. Replace the old
+`TELEGRAM_ALLOWED_USER_ID` line in the server's `.env`, then rebuild and recreate the bot:
+
+```sh
+docker compose up -d --build --force-recreate bot
+```
+
+Send `/start` to the bot from the configured account. Username matching ignores case and
+accepts the setting with or without `@`; users without that username cannot operate the bot.
+Existing numeric queue identities upgrade automatically, and queued jobs keep their chat IDs.
